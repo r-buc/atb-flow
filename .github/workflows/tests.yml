@@ -1,0 +1,42 @@
+name: Berry & Python Unit Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - '*.pdf'
+      - '**/*.pdf'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - '*.pdf'
+      - '**/*.pdf'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get install -y libreadline-dev
+
+      - name: Clone and build Berry interpreter
+        run: |
+          git clone --depth=1 https://github.com/berry-lang/berry.git
+          cd berry
+          make
+
+      - name: Run Berry unit tests (gateway.be)
+        run: ./berry/berry -m tests:. tests/test_gateway.be
+
+      - name: Run Python unit tests (profile_valve.py)
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
