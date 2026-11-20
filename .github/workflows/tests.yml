@@ -9,7 +9,6 @@ on:
       - '*.pdf'
       - '**/*.pdf'
   pull_request:
-    branches: [ main ]
     paths-ignore:
       - '*.md'
       - '**/*.md'
@@ -24,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: sudo apt-get install -y libreadline-dev
@@ -38,5 +37,5 @@ jobs:
       - name: Run Berry unit tests (gateway.be)
         run: ./berry/berry -m tests:. tests/test_gateway.be
 
-      - name: Run Python unit tests (profile_valve.py)
+      - name: Run Python unit tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
