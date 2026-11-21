@@ -44,6 +44,7 @@ end
 
 class MockTasmota
     var _cmds
+    var _cmd_log
     var _rules
     var _timers
     var _epoch_ms
@@ -55,6 +56,7 @@ class MockTasmota
 
     def init()
         self._cmds              = {}
+        self._cmd_log           = []
         self._rules             = {}
         self._timers            = []
         self._epoch_ms          = 1000
@@ -63,6 +65,11 @@ class MockTasmota
         self.last_response      = nil
         self._wire              = MockWire(0x40)
         self._wire_scan_enabled = true
+    end
+
+    def cmd(command_str)
+        self._cmd_log.push(str(command_str))
+        return {}
     end
 
     def read_sensors()

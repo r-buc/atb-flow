@@ -25,6 +25,19 @@ class SensorManager
       tasmota.add_rule("?#mac", /val, trig, payload -> self._on_ble_rule(payload), "atb_sensors_ble")
     except ..
     end
+
+    # MI32.period is reset to TelePeriod on every boot in MI32Init(); apply 60s after init.
+    try
+      tasmota.set_timer(3000, / -> self._apply_mi32_period())
+    except ..
+    end
+  end
+
+  def _apply_mi32_period()
+    try
+      tasmota.cmd("MI32Period 60")
+    except ..
+    end
   end
 
   def _default_config()

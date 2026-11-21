@@ -10,11 +10,11 @@ if [ "$1" = "--setup-template" ]; then
     # GPIO4  = DS18x20 (1312)
     # GPIO8  = I2C SDA (640)
     # GPIO9  = I2C SCL (608)
-    # SetOption115 1 = Enable ESP32 MI32 BLE driver (passive ATC/PVVX/BTHome room sensors)
-    # MI32Period 60  = Publish BLE telemetry every 60s (instead of default 300s TelePeriod)
+    # SetOption115 1 = Enable ESP32 MI32 BLE driver (passive BTHome v2 / ATC / PVVX room sensors)
+    # Note: MI32Period is non-persistent in Tasmota and is set to 60s on boot by sensors.be
     # Motor pins (5, 6, 7, 14, 15, 16, 17, 18, 21) remain None (0) for Berry gpio control
     curl -sS -G -H "$REFERER_HEADER" "http://$TASMOTA_HOST:$TASMOTA_PORT/cm" \
-        --data-urlencode 'cmnd=Backlog I2CDriver14 0; SetOption115 1; MI32Period 60; Template {"NAME":"ATB-Flow-HKV","GPIO":[0,0,0,0,1312,0,0,0,640,608,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"FLAG":0,"BASE":1}; Module 0'
+        --data-urlencode 'cmnd=Backlog I2CDriver14 0; SetOption115 1; Template {"NAME":"ATB-Flow-HKV","GPIO":[0,0,0,0,1312,0,0,0,640,608,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"FLAG":0,"BASE":1}; Module 0'
     echo
     echo "Waiting 5s for Tasmota to reboot after template change..."
     sleep 5

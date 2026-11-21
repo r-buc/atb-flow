@@ -209,7 +209,9 @@ check("Deleted room bad removed",              !sm.config['rooms'].contains('bad
 check("Deleted RL ch 2 removed",               !sm.config['ds18b20']['rl'].contains('2'))
 
 import autoexec
+global.tasmota.run_timers()
 check("global.sensors populated by autoexec.be", global.sensors != nil)
+check("MI32Period 60 applied via boot timer",   size(global.tasmota._cmd_log) > 0 && global.tasmota._cmd_log[size(global.tasmota._cmd_log) - 1] == "MI32Period 60")
 
 # Cleanup temp config file
 try os.remove(test_cfg_path) except .. end
