@@ -1,0 +1,13 @@
+# Compiled Berry bytecode
+*.bec
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local calibration profiles and captured current traces
+valve_profile.json
+traces/
+
+# Local Berry interpreter build directory (if cloned locally)
+berry/
