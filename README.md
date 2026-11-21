@@ -74,7 +74,7 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
 
 Alle mathematischen Formeln, Pinbelegungen, Stücklisten (BOM), der Referenz-Code für das Gateway sowie der detaillierte Umsetzungsplan sind im System-Design-Dokument beschrieben:
 
-* 📘 **[System-Design: FBH-Steuerung (Heizen & Kühlen)](system_design_dokument_fbh_steuerung.md)**
+* 📘 **[System-Design: FBH-Steuerung (Heizen & Kühlen)](atb_flow_system_design.md)**
 * 📐 **[Elektrischer Schaltplan (SVG)](schaltplan_hkv_knoten.svg)**
 
 ## 📜 Lizenz

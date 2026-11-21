@@ -1,4 +1,6 @@
-# System-Design: FBH-Steuerung (Heizen & Kühlen)
+# ATB-Flow: System-Design (FBH Heizen & Kühlen)
+
+**ATB-Flow** = ***A**ctive **T**hermal-spread **B**alancing & **Flow** Optimizer* (in Anlehnung an DIN/TS 94679-4).
 
 **Umfang:** 4 Heizkreisverteiler (2×2, 2×4 = 12 Kreise), 10 Räume, Wärmepumpe via Modbus TCP (Tasmota32-S3 / Berry).
 
@@ -6,11 +8,11 @@
 
 * **Mindestvolumenstrom (**$\dot{V}_{\min}$**):** Jederzeitige Sicherstellung für Wärmepumpe (Heizen, Kühlen, Abtauen) durch übergeordneten Override und lokalen Fail-Safe.
 
-* **Stetige Ventilregelung (**$0\text{--}100\,\%$**):** $3{,}0\text{--}3{,}3\,\text{V}$ DC-Getriebemotoren (`Sygonix SY365` / `HmIP-VDMOT`, Leerlauf ca. $25\,\text{mA}$, Blockierstrom ca. $90\text{--}120\,\text{mA}$, Hub $4{,}3\text{--}4{,}5\,\text{mm}$); Positionsbestimmung über Strommessung (`INA219`) und Laufzeit; Topmeter voll geöffnet.
+* **Stetige Ventilregelung (**$0\text{--}100\,\%$**):** $3{,}0\,\text{V}$ DC-Getriebemotoren (`Hysen HY365` / `Sygonix SY365`, Leerlauf $25\,\text{mA}$, Anlauf-/Blockierstrom $90\,\text{mA}$, Stellkraft $100\,\text{N}$, Hub $4{,}5\,\text{mm}$ in $35\,\text{s}$ Leerlauf, Baubreite $44{,}5\,\text{mm}$, IP52, M30×1,5); Positionsbestimmung über Strommessung (`INA219`) und Laufzeit; Topmeter voll geöffnet.
 
 * **Kühlbetrieb:** Inverses Regelverhalten; rechnerische Taupunktüberwachung (Magnus-Formel + Sicherheitsmarge); Sperrung von Feuchträumen und Kreisen ohne aktuelle Sensordaten (*Max-Age-Check*).
 
-* **Spannungsversorgung:** Zentrale $12\,\text{V DC}$ (SELV) Einspeisung im Heizraum über vorhandene Sternleitungen; keine $230\,\text{V}$ in den Verteilern.
+* **Spannungsversorgung:** $5\,\text{V DC}$ je Knoten (wahlweise über USB-C oder `5V/VIN`-Schraubklemme, zentral oder dezentral noch offen). Logik und Motor-Lastpfad werden direkt über den $3{,}3\,\text{V}$-Onboard-Regler des ESP32-S3-DevKits gespeist (dank Mutex max. 1 Motor à $\le 90\,\text{mA}$ gleichzeitig aktiv).
 
 * **Zweistufiges Deployment:**
 
@@ -23,15 +25,16 @@
 ### 2.1 Topologie
 
 ```
-[Heizraum]
-  |-- Wärmepumpe (Modbus TCP Server)
-  |-- Netzteil HDR-60-12 im Kleinverteiler (12V DC auf 4x Bestandsleitung)
-        |---> HKV 1 (2 Kreise, Slave)
-        |---> HKV 2 (2 Kreise, Slave)
-        |---> HKV 3 (4 Kreise, Slave)
-        +---> HKV 4 (4 Kreise, Master: WP-Kommunikation & Koordinator)
-                ^
-                +-- BLE 5.0 Empfang: 10x Raumsensor (LYWSD03MMC, Temp + rH%)
+[Wärmepumpe (Modbus TCP Server)]
+        ^
+        | (WLAN / Modbus TCP)
+        v
+  HKV 4 (4 Kreise, Master: WP-Kommunikation & Koordinator)
+    |--< WLAN (HTTP / MQTT) >-- HKV 1 (2 Kreise, Slave)
+    |--< WLAN (HTTP / MQTT) >-- HKV 2 (2 Kreise, Slave)
+    |--< WLAN (HTTP / MQTT) >-- HKV 3 (4 Kreise, Slave)
+    ^
+    +-- BLE 5.0 Empfang: 10x Raumsensor (LYWSD03MMC, Temp + rH%)
 
 ```
 
@@ -39,19 +42,52 @@
 
 * **Controller:** `ESP32-S3-WROOM-1U-N16R8` (16 MB Flash, 8 MB Octal-PSRAM, BLE 5.0) auf 44-Pin Schraubklemmen-Breakout, Firmware `tasmota32s3-bluetooth.bin` (nutzt PSRAM automatisch für Berry-VM & BLE-Stack).
 
-* **DC-DC Wandler 1 (**$12\,\text{V} \rightarrow 5{,}0\,\text{V}$**):** Speist ESP32-S3 (`5V/VIN`). $3{,}3\,\text{V}$ Logikspannung für `INA219` und `DS18B20`-Adapterboard kommt vom ESP32-S3-LDO.
-
-* **DC-DC Wandler 2 (**$12\,\text{V} \rightarrow 3{,}00\text{--}3{,}30\,\text{V}$**):** Speist über `INA219` (`VIN+`/`VIN-`) den Motortreiber-Lastpfad (`VM`).
+* **3,3-V-Verteilung (Logik & High-Side-Strommessung):** Der `3V3`-Ausgang des ESP32-S3-DevKits speist das `DS18B20`-Adapterboard (`VCC`), die Logik des `INA219` (`VCC`) sowie dessen High-Side-Messeingang (`VIN+`). Ausschließlich der Messausgang `VIN-` (`3V3_MOT`) führt weiter auf den Versorgungseingang (`VCC`) von `DRV8833 #1` und `#2`, sodass der gesamte Motorstrom über den $0{,}1\,\Omega$-Shunt des `INA219` fließt und über `DRV8833 GND` nach `GND` zurückkehrt.
 
 * **1-Wire Anbindung:** 1× `DS18B20`-Adapterboard (mit integriertem $4{,}7\,\text{k}\Omega$ Pull-up und Schraubklemme) je HKV; Bündelung der 3 bzw. 5 Sensoren über 3× WAGO 221-415 auf dieses eine Adapterboard.
 
-* **Motortreiber:** 1× (2er-HKV) bzw. 2× (4er-HKV) `DRV8833` ($2{,}7\text{--}10{,}8\,\text{V}$, benötigt keine separate Logikspannung; `AISEN/BISEN/FLT` bleiben unbeschaltet).
+* **Motortreiber:** 1× (2er-HKV) bzw. 2× (4er-HKV) `DRV8833` ($2{,}7\text{--}10{,}8\,\text{V}$ über `VCC`, benötigt keine separate Logikspannung; Freigabe über `EEP` / `nSLEEP`; Fehlerausgang `ULT` / `nFAULT` bleibt unbeschaltet).
 
-* **Gehäuse:** Kompaktes Aufputz-Abzweiggehäuse (IP54/IP65 mit Gummimembran-Einführungen, z. B. Spelsberg Abox / Hensel, ca. $150 \times 110 \times 70\,\text{mm}$), Befestigung im HKV-Blechkasten per Magnetfüßen oder Klettband; externe WLAN/BLE-Antenne nach außen geführt.
+* **Gehäuse:** Kompaktes Aufputz-Abzweiggehäuse (IP54/IP65 mit Gummimembran-Einführungen, z. B. Spelsberg Abox / OBO, ca. $125 \times 125 \times 65\,\text{mm}$ oder $150 \times 110 \times 70\,\text{mm}$), Befestigung im HKV-Blechkasten per Magnetfüßen oder Klettband; externe WLAN/BLE-Antenne nach außen geführt.
 
 ### 2.3 Elektrischer Schaltplan (je HKV-Knoten)
 
-![Elektrischer Schaltplan je HKV-Knoten](schaltplan_hkv_knoten.svg)
+```
+5V DC Versorgung (USB-C Buchse ODER 5V/GND Schraubklemme)
+  |
+  +--> [USB-C / 5V (VIN)]
+  +--> [GND] --> === GND (Gemeinsames Bezugspotential aller Baugruppen)
+
++-------------------------------+       +-----------------------------+
+|                      [GPIO 4] |------>| DAT   1x DS18B20-Adapter    |==> DS18B20
+|                               |   +-->| VCC   (inkl. 4.7k Pull-up)  |    (3..5x)
+|                               |   |   | GND                         |--> === GND
+|  ESP32-S3-WROOM-1U-N16R8      |   |   +-----------------------------+
+|  (44-Pin Screw-Breakout)      |   |
+|                               |   |   +-----------------------------+
+|                         [3V3] |---+-->| VCC         INA219          |
+|                               |   +-->| VIN+ ---[0.1R Shunt]--> VIN-|---------------+
+|                      [GPIO 8] |------>| SDA                         |               |
+|                      [GPIO 9] |------>| SCL                     GND |--> === GND    |
+|                               |       +-----------------------------+               |
+|                               |                                                     | 3V3_MOT
+|                               |       +-----------------------------+               | (Lastpfad)
+|                      [GPIO 5] |------>| IN1              OUT1, OUT2 |==> Motor 1    |
+|                      [GPIO 6] |------>| IN2  DRV8833 #1  OUT3, OUT4 |==> Motor 2    |
+|                      [GPIO 7] |------>| IN3                     GND |--> === GND    |
+|                     [GPIO 15] |------>| IN4                     VCC |<--------------+
+|                     [GPIO 14] |---+-->| EEP (nSLEEP)                |               |
+|                               |   |   +-----------------------------+               |
+|  (Nur bei 4er-HKV bestückt:)  |   |                                                 |
+|                               |   |   +-----------------------------+               |
+|                               |   +-->| EEP (nSLEEP)            VCC |<--------------+
+|                     [GPIO 16] |------>| IN1              OUT1, OUT2 |==> Motor 3
+|                     [GPIO 17] |------>| IN2  DRV8833 #2  OUT3, OUT4 |==> Motor 4
+|                     [GPIO 18] |------>| IN3                     GND |--> === GND
+|                     [GPIO 21] |------>| IN4                         |
++-------------------------------+       +-----------------------------+
+
+```
 
 ### 2.4 Pinbelegung ESP32-S3 (N16R8)
 
@@ -59,32 +95,29 @@
 
 | Pin | Verbindung | Funktion | 
 | ----- | ----- | ----- | 
-| `5V (VIN)`, `GND` | Step-Down 1 ($5{,}0\,\text{V}$) | Versorgung ESP32-S3 | 
-| `3V3` | `INA219` (`VCC`), 1× `DS18B20`-Adapterboard (`VCC`) | $3{,}3\,\text{V}$ Logik | 
+| `USB-C` oder `5V (VIN)`, `GND` | $5\,\text{V DC}$ Einspeisung | Versorgung ESP32-S3 | 
+| `3V3` | `INA219` (`VCC` & `VIN+`), 1× `DS18B20`-Adapterboard (`VCC`) | $3{,}3\,\text{V}$ Logik & High-Side-Messeingang | 
+| *(via `INA219 VIN-`)* | `DRV8833 #1 & #2` (`VCC`) | Gemessener $3{,}3\,\text{V}$ Motor-Lastpfad (`3V3_MOT`) | 
 | `GPIO 8 / 9` | `INA219` (`SDA / SCL`) | I2C Strommessung (S3-Standard) | 
 | `GPIO 4` | 1× `DS18B20`-Adapterboard (`DAT`, Pull-up integriert) | 1-Wire ($1\times T_{VL}$, $2\text{--}4\times T_{RL}$) | 
-| `GPIO 5, 6` | `DRV8833 #1` (`AIN1, AIN2`) | Motor Kreis 1 | 
-| `GPIO 7, 15` | `DRV8833 #1` (`BIN1, BIN2`) | Motor Kreis 2 | 
-| `GPIO 16, 17` | `DRV8833 #2` (`AIN1, AIN2`) | Motor Kreis 3 *(nur 4er-HKV)* | 
-| `GPIO 18, 21` | `DRV8833 #2` (`BIN1, BIN2`) | Motor Kreis 4 *(nur 4er-HKV)* | 
+| `GPIO 5, 6` | `DRV8833 #1` (`IN1, IN2`) | Motor Kreis 1 | 
+| `GPIO 7, 15` | `DRV8833 #1` (`IN3, IN4`) | Motor Kreis 2 | 
+| `GPIO 16, 17` | `DRV8833 #2` (`IN1, IN2`) | Motor Kreis 3 *(nur 4er-HKV)* | 
+| `GPIO 18, 21` | `DRV8833 #2` (`IN3, IN4`) | Motor Kreis 4 *(nur 4er-HKV)* | 
 | `GPIO 14` | `DRV8833 #1 & #2` (`EEP` / `nSLEEP`) | Treiber-Enable (`HIGH` = aktiv) | 
 
-## 3. Stückliste (BOM) & Kosten
+## 3. Stückliste (BOM) & Kosten *(exkl. 5-V-Spannungsversorgung)*
 
 | Pos. | Artikel | Menge | Einzelpreis | Gesamt | Hinweis | 
 | ----- | ----- | ----- | ----- | ----- | ----- | 
-| 1 | `Sygonix SY365` (`SY-6807138`) motorischer Stellantrieb ($3\,\text{V DC}$, $25\text{--}90\,\text{mA}$, $4{,}5\,\text{mm}$ Hub, RJ09/RJ10) | 12 | 9,79 € | 117,50 € | Baugleich zu `HmIP-VDMOT` ($\le 44\,\text{mm}$); ab 5 Stk. 9,79 € bei Voelkner/Conrad | 
-| 2 | `ESP32-S3-WROOM-1U-N16R8` + Screw-Terminal + Antenne\\ https://amzn.eu/d/05I7vqJh | 4 | 11,00 € | 44,00 € | 8 MB PSRAM, Antenne außerhalb Blechkasten | 
-| 3 | `DRV8833` Dual-Motortreiber Breakout\\ https://amzn.eu/d/0gCWyFN3 | 6 | Set (1,17 €) | 7,00 € | Je 1× für 2er-HKV, je 2× für 4er-HKV ($2{,}7\text{--}10{,}8\,\text{V}$) | 
-| 4 | `INA219` I2C-Stromsensor Breakout\\ https://amzn.eu/d/0gUydp1c | 4 | Set (2,25 €) | 9,00 € | In $3{,}0\text{--}3{,}3\,\text{V}$ Motor-Zuleitung (`VM`) | 
-| 5 | MeanWell `HDR-60-12` ($12\,\text{V}$, $4{,}5\,\text{A}$, 3 TE) | 1 | 21,00 € | 21,00 € | Zentral im Heizraum | 
-| 6 | `LM2596S` DC-DC Step-Down-Modul\\ https://amzn.eu/d/02fINAyO | 8 | Set (1,63 €) | 13,00 € | 2× je HKV ($5{,}0\,\text{V}$ & $3{,}00\text{--}3{,}30\,\text{V}$) | 
-| 7 | `DS18B20` Edelstahlhülse (1 m) inkl. Adapterboard ($4{,}7\,\text{k}\Omega$) | 16 | 1,50 € | 24,00 € | 4× Vorlauf, 12× Rücklauf (je 1 Adapterboard pro HKV genutzt) | 
-| 8 | Xiaomi Mijia `LYWSD03MMC` (BLE)\\ https://de.aliexpress.com/item/4000406818501.html | 10 | 5,50 € | 55,00 € | OTA-Flash auf *pvvx/ATC* Firmware | 
-| 9 | **Gehäuse HKV-Knoten:** Aufputz-Abzweigkasten IP65 ($150 \times 110 \times 70\,\text{mm}$, Gummimembranen, z. B. Spelsberg Abox 100 / OBO T100) | 4 | 6,50 € | 26,00 € | Nimmt ESP32-Breakout, 2× LM2596, INA219, DRV8833 & Wago-Klemmen auf | 
-| 10 | **Gehäuse Heizraum:** Kleinverteiler Aufputz 1-reihig (4–6 TE, IP65, inkl. Hutschiene & PE/N-Klemme) | 1 | 9,50 € | 9,50 € | Für MeanWell `HDR-60-12` und normgerechte 12V-Sternverteilung | 
-|  |  |  |  |  |  | 
-| **Summe** |  |  |  | **326,00 €** | *(Ersparnis gegenüber `HmIP-VDMOT`: \~90 €)* | 
+| 1 | `Hysen HY365` / `Sygonix SY365` (`SY-6807138`) motorischer Stellantrieb ($3{,}0\,\text{V DC}$, $25\text{--}90\,\text{mA}$, $100\,\text{N}$, $4{,}5\,\text{mm}$ Hub in $35\,\text{s}$, M30×1,5, IP52, RJ09) | 12 | 9,79 € | 117,50 € | OEM-Original von Xiamen Hysen ($44{,}5\,\text{mm}$ schmal); ab 5 Stk. 9,79 € bei Voelkner/Conrad | 
+| 2 | `ESP32-S3-WROOM-1U-N16R8` + Screw-Terminal + Antenne  https://amzn.eu/d/05I7vqJh | 4 | 11,00 € | 44,00 € | 8 MB PSRAM, Antenne außerhalb Blechkasten | 
+| 3 | `DRV8833` Dual-Motortreiber Breakout  https://amzn.eu/d/0gCWyFN3 | 6 | Set (1,17 €) | 7,00 € | Je 1× für 2er-HKV, je 2× für 4er-HKV ($2{,}7\text{--}10{,}8\,\text{V}$ an `VCC`) | 
+| 4 | `INA219` I2C-Stromsensor Breakout  https://amzn.eu/d/0gUydp1c | 4 | Set (2,25 €) | 9,00 € | Zwischen `3V3` (`VIN+`) und `DRV8833 VCC` (`VIN-`) | 
+| 5 | `DS18B20` Edelstahlhülse (1 m) inkl. Adapterboard ($4{,}7\,\text{k}\Omega$) | 16 | 1,50 € | 24,00 € | 4× Vorlauf, 12× Rücklauf (je 1 Adapterboard pro HKV genutzt) | 
+| 6 | Xiaomi Mijia `LYWSD03MMC` (BLE)  https://de.aliexpress.com/item/4000406818501.html | 10 | 5,50 € | 55,00 € | OTA-Flash auf *pvvx/ATC* Firmware | 
+| 7 | **Gehäuse HKV-Knoten:** Aufputz-Abzweigkasten IP65 (ca. $150 \times 110 \times 70\,\text{mm}$, Gummimembranen, z. B. Spelsberg Abox / OBO T60–T100) | 4 | 6,50 € | 26,00 € | Nimmt ESP32-Breakout, INA219, DRV8833, Adapterboard & Wago-Klemmen auf | 
+| **Summe** |  |  |  | **282,50 €** | *(zzgl. 5-V-Versorgung zentral oder dezentral)* | 
 
 ## 4. Dumb Gateway Spezifikation (Phase 0 & 1)
 
@@ -92,11 +125,11 @@
 
 * **`RawDrive`:** `{"ch":1..4, "dir":"open"|"close", "max_ms":5000, "cutoff_ma":150, "inrush_ms":100, "sample_ms":25}`
 
-  * Erzwingt Mutex (nur 1 Kanal aktiv), blendet Einschaltstrom für `inrush_ms` aus, tastet Strom alle `sample_ms` ab, stoppt bei $I \ge \text{cutoff\_ma}$ oder `max_ms` (Cap: $35\,000\,\text{ms}$).
+  * Erzwingt Mutex (nur 1 Kanal aktiv), blendet Einschaltstrom für `inrush_ms` aus, tastet Strom alle `sample_ms` ab, stoppt bei $I \ge \text{cutoff\_ma}$ oder `max_ms` (Cap: $45\,000\,\text{ms}$, da `HY365` $35\,\text{s}$ Leerlauf-Hubzeit hat).
 
   * Response: `{"RawDrive": {"ch":1, "dir":"close", "stop_reason":"CURRENT_CUTOFF"|"TIME_LIMIT", "elapsed_ms":..., "peak_ma":..., "trace_ma":[...]}}`
 
-* **`RawStop`:** Schaltet `EEP` (`STBY`) und alle Motor-Pins sofort auf `LOW`.
+* **`RawStop`:** Schaltet `EEP` (`nSLEEP`) und alle Motor-Pins (`IN1..IN4`) sofort auf `LOW`.
 
 * **`Status 10`:** Tasmota-Standardabfrage für `DS18B20` und BLE-Sensoren.
 
@@ -108,15 +141,15 @@ import string
 import math
 
 class DumbValveGateway
-  var wire, ina_addr, pin_stby, ch_pins, is_moving
+  var wire, ina_addr, pin_eep, ch_pins, is_moving
 
   def init()
     self.ina_addr = 0x40
-    self.pin_stby = 14
+    self.pin_eep = 14 # DRV8833 EEP (nSLEEP)
     self.ch_pins = {1:[5,6], 2:[7,15], 3:[16,17], 4:[18,21]}
     self.is_moving = false
-    gpio.pin_mode(self.pin_stby, gpio.OUTPUT)
-    gpio.digital_write(self.pin_stby, gpio.LOW)
+    gpio.pin_mode(self.pin_eep, gpio.OUTPUT)
+    gpio.digital_write(self.pin_eep, gpio.LOW)
     for ch: self.ch_pins.keys()
       for p: self.ch_pins[ch]
         gpio.pin_mode(p, gpio.OUTPUT)
@@ -124,12 +157,15 @@ class DumbValveGateway
       end
     end
     self.wire = tasmota.wire_scan(self.ina_addr)
+    if self.wire
+      self.wire.write(self.ina_addr, 0x00, 0x399F, 2) # Continuous Shunt+Bus, 12-bit
+    end
     tasmota.add_cmd('RawDrive', /cmd, idx, payload -> self.cmd_raw_drive(payload))
     tasmota.add_cmd('RawStop',  /cmd, idx, payload -> self.cmd_raw_stop())
   end
 
   def stop_all()
-    gpio.digital_write(self.pin_stby, gpio.LOW)
+    gpio.digital_write(self.pin_eep, gpio.LOW)
     for ch: self.ch_pins.keys()
       gpio.digital_write(self.ch_pins[ch][0], gpio.LOW)
       gpio.digital_write(self.ch_pins[ch][1], gpio.LOW)
@@ -164,7 +200,7 @@ class DumbValveGateway
     var ch = int(p["ch"])
     var dir = str(p["dir"])
     var max_ms = p.contains("max_ms") ? int(p["max_ms"]) : 5000
-    if max_ms > 35000 max_ms = 35000 end
+    if max_ms > 45000 max_ms = 45000 end
     var cutoff_ma = p.contains("cutoff_ma") ? real(p["cutoff_ma"]) : 150.0
     var inrush_ms = p.contains("inrush_ms") ? int(p["inrush_ms"]) : 100
     var sample_ms = p.contains("sample_ms") ? int(p["sample_ms"]) : 25
@@ -174,7 +210,7 @@ class DumbValveGateway
     var pins = self.ch_pins[ch]
     gpio.digital_write(pins[0], dir == "open" ? gpio.HIGH : gpio.LOW)
     gpio.digital_write(pins[1], dir == "open" ? gpio.LOW : gpio.HIGH)
-    gpio.digital_write(self.pin_stby, gpio.HIGH)
+    gpio.digital_write(self.pin_eep, gpio.HIGH)
 
     var start_t = tasmota.millis()
     var trace = []
@@ -308,13 +344,13 @@ Mehrkreis-Räume nutzen denselben Raum-Soll-/Istwert, regeln ihre Ventile aber s
 
 * **Phase 0 – Testaufbau & Auto-Profiling (Woche 1):**
 
-  * Aufbau 1× S3-Knoten am Schreibtisch; Einstellung Step-Downs ($5{,}00\,\text{V}$ / $3{,}00\text{--}3{,}30\,\text{V}$); Flash `tasmota32s3-bluetooth.bin`; Deployment `gateway.be`.
+  * Aufbau 1× S3-Knoten am Schreibtisch (Versorgung direkt via USB-C); Flash `tasmota32s3-bluetooth.bin`; Deployment `gateway.be`.
 
-  * Remote-Entwicklung der Auto-Profiling- und Kalibrierlogik durch Agenten; Speicherung der Ventilparameter (`valve_profile.json`).
+  * Remote-Entwicklung der Auto-Profiling- und Kalibrierlogik durch Agenten (mit aufgeschraubter Blindkappe bzw. Testventil); Speicherung der Ventilparameter (`valve_profile.json`).
 
 * **Phase 1 – MVP am 2er-Verteiler (Woche 2):**
 
-  * Montage des 1-reihigen Kleinverteilers im Heizraum und Umklemmen der ersten Verteilerzuleitung auf $12\,\text{V DC}$; Einbau des ersten Knotens im IP65-Abzweiggehäuse am 2er-HKV.
+  * Einbau des ersten Knotens im IP65-Abzweiggehäuse am 2er-HKV und Anbindung an $5\,\text{V DC}$.
 
   * Remote-Regelung ($\Delta T$-Abgleich + WP-Modbus-Abfrage) durch Agenten; Ziel: Angleichung der Rücklauftemperaturen auf $\pm 0{,}3\,\text{K}$.
 
