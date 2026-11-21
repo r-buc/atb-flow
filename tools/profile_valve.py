@@ -261,7 +261,11 @@ class TasmotaGatewayClient:
     def send_command(self, cmnd: str) -> Dict[str, Any]:
         query = urllib.parse.urlencode({"cmnd": cmnd})
         url = f"{self.base_url}?{query}"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(
+            url,
+            headers={"Referer": f"http://{self.host}/"},
+            method="GET",
+        )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
