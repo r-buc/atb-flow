@@ -1,6 +1,7 @@
 import global
 import string
 import gateway
+import sensors
 
 # ---------------------------------------------------------------------------
 # Phase 0 / Phase 1: Dumb Valve Gateway bootloader
@@ -8,6 +9,7 @@ import gateway
 # (DRV8833 AIN/BIN and EEP/STBY) are actively pulled LOW before network init.
 # ---------------------------------------------------------------------------
 global.gateway = gateway
+global.sensors = sensors
 
 def _log_boot_status()
   var ip = tasmota.wifi('ip')

@@ -34,8 +34,10 @@ jobs:
           cd berry
           make
 
-      - name: Run Berry unit tests (gateway.be)
-        run: ./berry/berry -m tests:. tests/test_gateway.be
+      - name: Run Berry unit tests (gateway.be & sensors.be)
+        run: |
+          ./berry/berry -m tests:. tests/test_gateway.be
+          ./berry/berry -m tests:. tests/test_sensors.be
 
       - name: Run Python unit tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v

@@ -53,10 +53,15 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
 
 ## 🔧 CLI-Tools (`tools/`) & On-Device-Commands
 
-* **On-Device Tasmota-Commands (`gateway.be` + `valve_cal.be`)**:
+* **On-Device Tasmota-Commands (`gateway.be` + `valve_cal.be` + `sensors.be`)**:
   * `ValveCal <ch>` – Vollautomatische, schwellwertfreie Kalibrierung direkt auf dem ESP32-S3 (Homing, Schließ-/Öffnungshub mit `O(N)`-Kniepunkt-Erkennung, Persistenz in `valve_profile.json`).
   * `ValvePos {"ch":1,"pos":50}` – Stetige Ventilpositionierung nach **Öffnungsgrad** (`0 %` = vollständig geschlossen, `100 %` = vollständig geöffnet am Touch-Point) inkl. Endlagen-Drift-Eliminierung.
   * `ValveStatus [ch]` – Aktueller Status und gespeicherte Kanalprofile.
+  * `SensorScan` – Listet alle erkannten 1-Wire-`DS18B20` (inkl. 12-stelliger `Id`) und passiven BLE-Raumsensoren (`MI32`, inkl. `MAC`, Temp, rH%, RSSI) inkl. aktueller Zuordnung auf.
+  * `SensorMap <json>` – Persistentes Mapping in `sensors.json` für Vorlauf (`{"vl":"<ID>"}`), Rücklauf (`{"ch":1,"id":"<ID>"}`) und BLE-Raumsensoren (`{"room":"wohnzimmer","mac":"A4:C1:38:...","channels":[1,2],"allow_cooling":true,"host_hkv":false}`).
+  * `SensorWaterbath [ref_temp]` – Wasserbad-Offset-Abgleich aller gemappten `DS18B20` (gegen Mittelwert oder Referenztemperatur) inkl. Persistenz in `sensors.json`.
+  * `SensorStatus` – Kalibrierte Vor-/Rücklauftemperaturen inkl. $\Delta T$, Raumwerte inkl. Taupunkt (Magnus-Formel) und 20-Min.-*Max-Age*-Prüfung (`stale`).
+  * `./deploy.sh --setup-template` – Konfiguriert das Tasmota-GPIO-Template (`GPIO4` DS18x20, `GPIO8/9` I2C), deaktiviert natives INA219-Polling (`I2CDriver14 0`) und aktiviert BLE `MI32` (`SetOption115 1`, `MI32Period 60`).
 * **`tools/profile_valve.py`** – Remote Auto-Profiling & schwellwertfreie Ventilkalibrierung inkl. ASCII-Stromprofil und Trace-Export über das ESP32-S3 Tasmota-Gateway.
 * **`tools/drive_valve.py`** – Minimales Live-CLI zum direkten Auf-/Zufahren eines Kanals mit zeilenweiser Stromausgabe und automatischem Cutoff.
 * **`tools/telink_mi_flasher.py`** – Linux-CLI-Port von `pvvx/TelinkMiFlasher.html` (inkl. Xiaomi-Firmware `2.1.1_0159` Mi-Token-Login & `sign_2.1.1_0159c.bin` OTA-Unlock):

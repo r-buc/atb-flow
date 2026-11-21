@@ -44,23 +44,47 @@ end
 
 class MockTasmota
     var _cmds
+    var _rules
     var _timers
     var _epoch_ms
+    var _rtc_utc
+    var _sensors_json
     var last_response
     var _wire
     var _wire_scan_enabled
 
     def init()
         self._cmds              = {}
+        self._rules             = {}
         self._timers            = []
         self._epoch_ms          = 1000
+        self._rtc_utc           = 1763750000
+        self._sensors_json      = "{}"
         self.last_response      = nil
         self._wire              = MockWire(0x40)
         self._wire_scan_enabled = true
     end
 
+    def read_sensors()
+        return self._sensors_json
+    end
+
+    def rtc()
+        return {'utc': self._rtc_utc, 'local': self._rtc_utc + 3600}
+    end
+
     def add_cmd(name, callback)
         self._cmds[name] = callback
+    end
+
+    def add_rule(pat, f, id, run_once)
+        self._rules[pat] = f
+    end
+
+    def emit_ble_tele(payload)
+        if self._rules.contains("?#mac")
+            self._rules["?#mac"]("mac", "?#mac", payload)
+        end
     end
 
     def resp_cmnd(json_str)
