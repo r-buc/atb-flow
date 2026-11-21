@@ -55,7 +55,7 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
 
 * **On-Device Tasmota-Commands (`gateway.be` + `valve_cal.be`)**:
   * `ValveCal <ch>` – Vollautomatische, schwellwertfreie Kalibrierung direkt auf dem ESP32-S3 (Homing, Schließ-/Öffnungshub mit `O(N)`-Kniepunkt-Erkennung, Persistenz in `valve_profile.json`).
-  * `ValvePos {"ch":1,"pos":50}` – Stetige Ventilpositionierung ($0\text{--}100\,\%$) inkl. Endlagen-Drift-Eliminierung.
+  * `ValvePos {"ch":1,"pos":50}` – Stetige Ventilpositionierung nach **Öffnungsgrad** (`0 %` = vollständig geschlossen, `100 %` = vollständig geöffnet am Touch-Point) inkl. Endlagen-Drift-Eliminierung.
   * `ValveStatus [ch]` – Aktueller Status und gespeicherte Kanalprofile.
 * **`tools/profile_valve.py`** – Remote Auto-Profiling & schwellwertfreie Ventilkalibrierung inkl. ASCII-Stromprofil und Trace-Export über das ESP32-S3 Tasmota-Gateway.
 * **`tools/drive_valve.py`** – Minimales Live-CLI zum direkten Auf-/Zufahren eines Kanals mit zeilenweiser Stromausgabe und automatischem Cutoff.
