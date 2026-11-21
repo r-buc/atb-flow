@@ -51,6 +51,25 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
 
 ---
 
+## 🔧 CLI-Tools (`tools/`)
+
+* **`tools/profile_valve.py`** – Remote Auto-Profiling & 3-Punkt-Ventilkalibrierung über das ESP32-S3 Tasmota-Gateway.
+* **`tools/telink_mi_flasher.py`** – Linux-CLI-Port von `pvvx/TelinkMiFlasher.html` (inkl. Xiaomi-Firmware `2.1.1_0159` Mi-Token-Login & `sign_2.1.1_0159c.bin` OTA-Unlock):
+  ```bash
+  pip install bleak
+  # Extrahierte Xiaomi-Cloud-Tokens anzeigen & Sensoren in Reichweite scannen
+  python3 tools/telink_mi_flasher.py list-tokens tokens.json --only-lywsd03mmc
+  python3 tools/telink_mi_flasher.py scan --tokens-file tokens.json
+
+  # Einzelnen LYWSD03MMC (2.1.1_0159) auf aktuelle pvvx/ATC-Firmware flashen
+  python3 tools/telink_mi_flasher.py flash --mac A4:C1:38:XX:XX:XX --tokens-file tokens.json
+
+  # Für neuere 2025er Hardware-Revisionen (B1.5 / B1.6 / B1.1) im 2-Stufen-Modus:
+  python3 tools/telink_mi_flasher.py flash --mac A4:C1:38:XX:XX:XX --tokens-file tokens.json --two-stage
+  ```
+
+---
+
 ## 📄 Weiterführende Dokumentation
 
 Alle mathematischen Formeln, Pinbelegungen, Stücklisten (BOM), der Referenz-Code für das Gateway sowie der detaillierte Umsetzungsplan sind im System-Design-Dokument beschrieben:
