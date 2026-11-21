@@ -32,6 +32,10 @@ check("gateway instance created",           type(gw) == 'instance')
 check("RawDrive command registered",        global.tasmota._cmds.contains('RawDrive'))
 check("RawStop command registered",         global.tasmota._cmds.contains('RawStop'))
 check("RawStatus command registered",       global.tasmota._cmds.contains('RawStatus'))
+check("RawResult command registered",       global.tasmota._cmds.contains('RawResult'))
+check("ValveCal command registered",        global.tasmota._cmds.contains('ValveCal'))
+check("ValvePos command registered",        global.tasmota._cmds.contains('ValvePos'))
+check("ValveStatus command registered",     global.tasmota._cmds.contains('ValveStatus'))
 
 var expected_pins = [14, 5, 6, 7, 15, 16, 17, 18, 21]
 for p : expected_pins
@@ -78,11 +82,15 @@ global.tasmota._cmds['RawDrive'](
     'RawDrive', 1,
     '{"ch":1,"dir":"open","max_ms":150,"cutoff_ma":100,"inrush_ms":100,"sample_ms":25}'
 )
-var rd1 = json.load(global.tasmota.last_response)['RawDrive']
+var rd1_start = json.load(global.tasmota.last_response)['RawDrive']
+check("RawDrive returns STARTED immediately",        rd1_start['status'] == 'STARTED')
+global.tasmota.run_timers()
+global.tasmota._cmds['RawResult']('RawResult', 1, '')
+var rd1 = json.load(global.tasmota.last_response)['RawResult']
 check("Inrush ignored -> stop_reason == TIME_LIMIT", rd1['stop_reason'] == 'TIME_LIMIT')
 check("elapsed_ms == 150",                           rd1['elapsed_ms'] == 150)
 check("peak_ma == 160.0",                            rd1['peak_ma'] == 160.0)
-check("trace_ma has 6 samples",                      size(rd1['trace_ma']) == 6)
+check("trace_ma has 7 samples",                      size(rd1['trace_ma']) == 7)
 check("All pins returned to LOW after drive",        gpio._states[14] == gpio.LOW && gpio._states[5] == gpio.LOW && gpio._states[6] == gpio.LOW)
 
 # ---------------------------------------------------------------------------
@@ -100,7 +108,9 @@ global.tasmota._cmds['RawDrive'](
     'RawDrive', 1,
     '{"ch":2,"dir":"close","max_ms":5000,"cutoff_ma":80,"inrush_ms":100,"sample_ms":25}'
 )
-var rd2 = json.load(global.tasmota.last_response)['RawDrive']
+global.tasmota.run_timers()
+global.tasmota._cmds['RawResult']('RawResult', 1, '')
+var rd2 = json.load(global.tasmota.last_response)['RawResult']
 check("Stall after inrush -> CURRENT_CUTOFF",        rd2['stop_reason'] == 'CURRENT_CUTOFF')
 check("Stopped at elapsed_ms == 125",                rd2['elapsed_ms'] == 125)
 check("Channel 2 pins returned to LOW",              gpio._states[7] == gpio.LOW && gpio._states[15] == gpio.LOW && gpio._states[14] == gpio.LOW)
@@ -114,7 +124,9 @@ global.tasmota._cmds['RawDrive'](
     'RawDrive', 1,
     '{"ch":3,"dir":"open","max_ms":5000,"cutoff_ma":100,"inrush_ms":100,"sample_ms":25}'
 )
-var rd3 = json.load(global.tasmota.last_response)['RawDrive']
+global.tasmota.run_timers()
+global.tasmota._cmds['RawResult']('RawResult', 1, '')
+var rd3 = json.load(global.tasmota.last_response)['RawResult']
 check("I2C read failure aborts immediately -> I2C_ERROR", rd3['stop_reason'] == 'I2C_ERROR')
 check("elapsed_ms == 0 on immediate I2C error",           rd3['elapsed_ms'] == 0)
 check("Standby pin LOW after I2C error",                  gpio._states[14] == gpio.LOW)
@@ -133,9 +145,56 @@ check("RawStop clears is_moving",                    gw.is_moving == false)
 check("RawStop returns OK",                          json.load(global.tasmota.last_response)['RawStop'] == 'OK')
 
 # ---------------------------------------------------------------------------
-# 8. Bootloader (autoexec.be)
+# 8. On-Device Auto-Calibration Math (valve_cal.be)
 # ---------------------------------------------------------------------------
-print("\n[8] Bootloader (autoexec.be)")
+print("\n[8] On-Device Auto-Calibration Math (valve_cal.be)")
+import valve_cal
+
+var close_trace = []
+var k_i = 0
+while k_i < 10
+    close_trace.push(25.0)
+    k_i += 1
+end
+k_i = 0
+while k_i < 100
+    close_trace.push(25.0)
+    k_i += 1
+end
+k_i = 0
+while k_i < 150
+    close_trace.push(25.0 + 0.35 * real(k_i + 1))
+    k_i += 1
+end
+var ck = valve_cal.detect_touch_knee(close_trace, size(close_trace) * 95)
+check("detect_touch_knee returns map",               ck != nil)
+check("detect_touch_knee idx near 109",              ck != nil && ck['touch_idx'] >= 105 && ck['touch_idx'] <= 114)
+check("detect_touch_knee i_free_close near 25 mA",   ck != nil && ck['i_free_close_ma'] >= 24.0 && ck['i_free_close_ma'] <= 26.0)
+
+var open_trace = [48.0, 50.0, 42.0]
+k_i = 0
+while k_i < 120
+    open_trace.push(40.0 - (22.0 / 120.0) * real(k_i))
+    k_i += 1
+end
+k_i = 0
+while k_i < 180
+    open_trace.push(18.0)
+    k_i += 1
+end
+k_i = 0
+while k_i < 30
+    open_trace.push(45.0)
+    k_i += 1
+end
+var ok = valve_cal.detect_open_liftoff_knee(open_trace, size(open_trace) * 95)
+check("detect_open_liftoff_knee returns map",        ok != nil)
+check("detect_open_liftoff_knee idx near 123",       ok != nil && ok['liftoff_idx'] >= 118 && ok['liftoff_idx'] <= 128)
+
+# ---------------------------------------------------------------------------
+# 9. Bootloader (autoexec.be)
+# ---------------------------------------------------------------------------
+print("\n[9] Bootloader (autoexec.be)")
 import autoexec
 check("global.gateway populated by autoexec.be",     global.gateway != nil)
 

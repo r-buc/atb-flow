@@ -29,8 +29,10 @@ curl -sS -G -H "$REFERER_HEADER" "http://$TASMOTA_HOST:$TASMOTA_PORT/cm" --data-
 echo "Uploading Berry script files"
 for file in *.be; do
     [ -f "$file" ] || continue
-    echo "  -> $file"
-    curl -sS -o /dev/null -H "$REFERER_HEADER" -F "file=@./$file" "http://$TASMOTA_HOST:$TASMOTA_PORT/ufsu"
+    fsize=$(stat -c%s "$file")
+    echo "  -> $file ($fsize bytes)"
+    curl -sS -o /dev/null -H "Expect:" -H "$REFERER_HEADER" -F "ufsu=@./$file" "http://$TASMOTA_HOST:$TASMOTA_PORT/ufsu?fsz=$fsize"
+    sleep 1
 done
 
 if [ -z "$GITHUB_ACTIONS" ]; then

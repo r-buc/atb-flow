@@ -100,7 +100,8 @@ def detect_touch_point(
         raise ValueError("sample_ms and window_size must be >= 1")
 
     threshold = i_free_ma + delta_i_touch_ma
-    start_idx = max(int(math.ceil(inrush_ms / float(sample_ms))) + 1, window_size - 1)
+    skip_samples = int(math.ceil(inrush_ms / float(sample_ms))) + 1
+    start_idx = skip_samples + window_size - 1
 
     if len(trace_ma) <= start_idx:
         return None
@@ -115,6 +116,302 @@ def detect_touch_point(
             return idx, t_touch_ms, round(avg, 3)
 
     return None
+
+
+def robust_median_sigma(values: List[float]) -> Tuple[float, float]:
+    """Return (median, robust_sigma) using MAD (1.4826 * MAD, floored at 1.0 mA)."""
+    if not values:
+        raise ValueError("values must not be empty")
+    med = statistics.median(values)
+    mad = statistics.median([abs(x - med) for x in values])
+    return float(med), max(1.0, 1.4826 * float(mad))
+
+
+def linear_regression_with_sigma(values: List[float]) -> Tuple[float, float, float]:
+    """
+    Ordinary least squares fit y = b + m * idx for idx = 0..len(values)-1.
+    Returns (intercept b, slope m, robust residual sigma).
+    """
+    n = len(values)
+    if n < 2:
+        val = float(values[0]) if n == 1 else 0.0
+        return val, 0.0, 1.0
+    sx = (n - 1) * n / 2.0
+    sxx = (n - 1) * n * (2 * n - 1) / 6.0
+    sy = sum(values)
+    sxy = sum(idx * y for idx, y in enumerate(values))
+    denom = n * sxx - sx * sx
+    m = (n * sxy - sx * sy) / denom if denom > 1e-9 else 0.0
+    b = (sy - m * sx) / n
+    residuals = [y - (b + m * idx) for idx, y in enumerate(values)]
+    _, rsig = robust_median_sigma(residuals)
+    return float(b), float(m), float(rsig)
+
+
+def detect_touch_point_knee(
+    trace_ma: List[float],
+    elapsed_ms: int,
+    start_idx: Optional[int] = None,
+    min_free_samples: int = 5,
+    min_ramp_samples: int = 10,
+    tail_trim_samples: int = 3,
+) -> Optional[Dict[str, Any]]:
+    """
+    Threshold-free Touch-Point detection via 2-segment piecewise linear regression:
+      Segment 1 (free-run, i <= k):  I(i) = c
+      Segment 2 (spring,   i >  k):  I(i) = c + m * (i - k),  with m > 0
+
+    Trims the initial inrush/adapter-hump window (~5s, capped at n/8) and final
+    hard-seat spike samples so the knee point is not pulled off-center.
+    Uses effective sample duration dt_ms = elapsed_ms / len(trace_ma).
+    """
+    n_full = len(trace_ma)
+    if elapsed_ms <= 0 or n_full < 25:
+        return None
+
+    dt_ms = float(elapsed_ms) / float(n_full)
+    if start_idx is None:
+        start_idx = min(int(round(5000.0 / dt_ms)), max(10, n_full // 8))
+    end_idx = max(start_idx + min_free_samples + min_ramp_samples + 1, n_full - tail_trim_samples)
+    end_idx = min(end_idx, n_full)
+
+    if end_idx < start_idx + min_free_samples + min_ramp_samples:
+        return None
+
+    y = [float(v) for v in trace_ma[:end_idx]]
+    n = len(y)
+    cnt = n - start_idx
+    sy = sum(y[start_idx:])
+    best_sse = float("inf")
+    best: Optional[Tuple[int, float, float, float]] = None
+
+    for k in range(start_idx + min_free_samples, n - min_ramp_samples):
+        r_len = n - 1 - k  # number of samples with i > k (x = 1..r_len)
+        sx = r_len * (r_len + 1) / 2.0
+        sxx = r_len * (r_len + 1) * (2 * r_len + 1) / 6.0
+        sxy = sum((i - k) * y[i] for i in range(k + 1, n))
+        denom = cnt * sxx - sx * sx
+        if denom <= 1e-9:
+            continue
+        m = (cnt * sxy - sx * sy) / denom
+        if m <= 0.05:
+            continue
+        c = (sy - m * sx) / cnt
+        sse = 0.0
+        for i in range(start_idx, n):
+            pred = c + (m * (i - k) if i > k else 0.0)
+            diff = y[i] - pred
+            sse += diff * diff
+        if sse < best_sse:
+            best_sse = sse
+            best = (k, c, m, math.sqrt(sse / cnt))
+
+    if best is None:
+        return None
+
+    k, c, m, rmse = best
+    t_touch_ms = int(round(k * dt_ms))
+    seat_pred_ma = c + m * (n_full - 1 - k)
+    return {
+        "touch_idx": k,
+        "t_touch_ms": t_touch_ms,
+        "dt_ms": round(dt_ms, 2),
+        "i_free_close_ma": round(c, 3),
+        "ramp_slope_ma_per_sample": round(m, 4),
+        "ramp_slope_ma_per_s": round(m * 1000.0 / dt_ms, 3),
+        "rmse_ma": round(rmse, 3),
+        "seat_pred_ma": round(seat_pred_ma, 2),
+    }
+
+
+def detect_open_liftoff_knee(
+    trace_ma: List[float],
+    elapsed_ms: int,
+    start_idx: int = 3,
+    min_ramp_samples: int = 10,
+    min_free_samples: int = 10,
+) -> Optional[Dict[str, Any]]:
+    """
+    Threshold-free lift-off detection on the opening stroke via descending
+    2-segment piecewise linear regression:
+      Segment 1 (spring unloading, i <  k):  I(i) = c + m * (k - i),  with m > 0
+      Segment 2 (free-run plateau, i >= k):  I(i) = c
+
+    Directly measures T_hub_auf (the spring-assisted working stroke duration)
+    and t_leer_open = elapsed_ms - T_hub_auf for cross-checking against t_touch_close.
+    """
+    n_full = len(trace_ma)
+    if elapsed_ms <= 0 or n_full < 30:
+        return None
+
+    dt_ms = float(elapsed_ms) / float(n_full)
+    # Trim the final ~6s (upper adapter hump + mechanical stop)
+    tail_trim = min(int(round(6000.0 / dt_ms)), max(5, n_full // 5))
+    end_idx = n_full - tail_trim
+    if end_idx < start_idx + min_ramp_samples + min_free_samples:
+        return None
+
+    y = [float(v) for v in trace_ma[:end_idx]]
+    n = len(y)
+    cnt = n - start_idx
+    sy = sum(y[start_idx:])
+    best_sse = float("inf")
+    best: Optional[Tuple[int, float, float, float]] = None
+
+    for k in range(start_idx + min_ramp_samples, n - min_free_samples):
+        l_len = k - start_idx
+        sx = l_len * (l_len + 1) / 2.0
+        sxx = l_len * (l_len + 1) * (2 * l_len + 1) / 6.0
+        sxy = sum((k - i) * y[i] for i in range(start_idx, k))
+        denom = cnt * sxx - sx * sx
+        if denom <= 1e-9:
+            continue
+        m = (cnt * sxy - sx * sy) / denom
+        if m <= 0.05:
+            continue
+        c = (sy - m * sx) / cnt
+        sse = 0.0
+        for i in range(start_idx, n):
+            pred = c + (m * (k - i) if i < k else 0.0)
+            diff = y[i] - pred
+            sse += diff * diff
+        if sse < best_sse:
+            best_sse = sse
+            best = (k, c, m, math.sqrt(sse / cnt))
+
+    if best is None:
+        return None
+
+    k, c, m, rmse = best
+    t_hub_auf_ms = int(round(k * dt_ms))
+    t_leer_open_ms = max(0, int(elapsed_ms) - t_hub_auf_ms)
+    return {
+        "liftoff_idx": k,
+        "t_hub_auf_ms": t_hub_auf_ms,
+        "t_leer_open_ms": t_leer_open_ms,
+        "dt_ms": round(dt_ms, 2),
+        "i_free_open_ma": round(c, 3),
+        "unload_slope_ma_per_s": round(m * 1000.0 / dt_ms, 3),
+        "rmse_ma": round(rmse, 3),
+    }
+
+
+class LiveOpenStallDetector:
+    """
+    Threshold-free live stall detector for opening strokes:
+    - Ignores breakaway/inrush phase automatically via a rolling baseline window
+      excluding the most recent 4 samples.
+    - Detects immediate stall if already at the upper mechanical stop.
+    - Triggers on 2 consecutive samples >= max(2.0 * median, median + max(15, 4.5 * sigma_rob)).
+    """
+
+    def __init__(self, initial_stall_ma: float = 45.0) -> None:
+        self.trace: List[float] = []
+        self.initial_stall_ma = float(initial_stall_ma)
+        self._consec = 0
+
+    def feed(self, sample_ma: float) -> Optional[Dict[str, Any]]:
+        val = float(sample_ma)
+        i = len(self.trace)
+        self.trace.append(val)
+
+        # Already jammed at upper stop during initial homing (not decaying)
+        if 15 <= i < 20:
+            m1 = statistics.median(self.trace[5:10])
+            m2 = statistics.median(self.trace[i - 5 : i + 1])
+            if m2 >= self.initial_stall_ma and m2 >= m1 - 2.0:
+                return {
+                    "reason": "AUTO_STALL_OPEN_INITIAL",
+                    "sample_idx": i,
+                    "current_ma": round(val, 2),
+                    "baseline_ma": round(m2, 2),
+                    "threshold_ma": round(self.initial_stall_ma, 2),
+                }
+
+        if i >= 20:
+            w_start = max(10, i - 65)
+            w_end = i - 4
+            if w_end - w_start >= 6:
+                med, sig = robust_median_sigma(self.trace[w_start:w_end])
+                thresh = max(2.0 * med, med + max(15.0, 4.5 * sig))
+                if val >= thresh:
+                    self._consec += 1
+                    if self._consec >= 2:
+                        return {
+                            "reason": "AUTO_STALL_OPEN",
+                            "sample_idx": i,
+                            "current_ma": round(val, 2),
+                            "baseline_ma": round(med, 2),
+                            "sigma_ma": round(sig, 2),
+                            "threshold_ma": round(thresh, 2),
+                        }
+                else:
+                    self._consec = 0
+        return None
+
+    def baseline_stats(self) -> Tuple[float, float]:
+        """Compute robust (median, sigma) from the settled free-run portion of the open trace."""
+        if len(self.trace) > 30:
+            return robust_median_sigma(self.trace[20:-5])
+        if len(self.trace) > 10:
+            return robust_median_sigma(self.trace[5:-2])
+        return robust_median_sigma(self.trace)
+
+
+class LiveCloseSeatDetector:
+    """
+    Threshold-free live hard-seat detector for closing strokes:
+    - Ignores inrush, free-run plateau, and the initial Touch-Point jump (valve spring preload).
+    - Arms only once the entire preceding 30-sample regression window is already
+      on the rising spring ramp (`win_mean >= base_med + 12 mA` and `slope >= 0.05 mA/sample`).
+    - Triggers when 2 consecutive samples jump >= max(12 mA, 4.5 * residual_sigma)
+      above the linear ramp extrapolation (indicating hard valve seat contact).
+    """
+
+    def __init__(self, arm_delta_ma: float = 12.0, min_ramp_slope: float = 0.05, min_excess_ma: float = 12.0) -> None:
+        self.trace: List[float] = []
+        self.arm_delta_ma = float(arm_delta_ma)
+        self.min_ramp_slope = float(min_ramp_slope)
+        self.min_excess_ma = float(min_excess_ma)
+        self._consec = 0
+
+    def feed(self, sample_ma: float) -> Optional[Dict[str, Any]]:
+        val = float(sample_ma)
+        i = len(self.trace)
+        self.trace.append(val)
+
+        if i < 45:
+            return None
+
+        base_end = min(i - 35, 45)
+        if base_end <= 10:
+            base_end = min(i - 5, 35)
+        base_med, _ = robust_median_sigma(self.trace[10:base_end])
+
+        win = self.trace[i - 34 : i - 4]
+        win_mean = sum(win) / float(len(win))
+        b, m, rsig = linear_regression_with_sigma(win)
+        if win_mean < base_med + self.arm_delta_ma or m < self.min_ramp_slope:
+            self._consec = 0
+            return None
+
+        pred = b + m * 34.0
+        excess = val - pred
+        thresh_excess = max(self.min_excess_ma, 4.5 * rsig)
+        if excess >= thresh_excess:
+            self._consec += 1
+            if self._consec >= 2:
+                return {
+                    "reason": "AUTO_SEAT_CLOSE",
+                    "sample_idx": i,
+                    "current_ma": round(val, 2),
+                    "pred_ma": round(pred, 2),
+                    "excess_ma": round(excess, 2),
+                    "threshold_excess_ma": round(thresh_excess, 2),
+                }
+        else:
+            self._consec = 0
+        return None
 
 
 def compute_calibration_parameters(
@@ -180,7 +477,7 @@ def compute_move_plan(
 
     # Drift elimination at endpoints 0% and 100%
     if u_new <= 0.0:
-        max_ms = min(35000, int(float(cal["t_close_ms"]) * 1.35))
+        max_ms = min(60000, int(float(cal["t_close_ms"]) * 1.35))
         return {
             "action": "DRIVE_TO_STALL",
             "dir": "close",
@@ -194,7 +491,7 @@ def compute_move_plan(
         # Note: 100% valve opening corresponds to the Touch-Point (plunger just lifts off pin).
         # However, per Section 5.1.3 ("Bei Ziel 0% oder 100% Fahrt bis I_stall zur Drift-Eliminierung"),
         # driving to upper stall and optionally stepping to touch point re-synchronizes position.
-        max_ms = min(35000, int(float(cal["t_open_total_ms"]) * 1.35))
+        max_ms = min(60000, int(float(cal["t_open_total_ms"]) * 1.35))
         return {
             "action": "DRIVE_TO_STALL",
             "dir": "open",
@@ -217,7 +514,7 @@ def compute_move_plan(
 
 def render_ascii_trace(
     trace_ma: List[float],
-    sample_ms: int = 25,
+    sample_ms: float = 25.0,
     touch_idx: Optional[int] = None,
     threshold_ma: Optional[float] = None,
     width: int = 60,
@@ -236,7 +533,7 @@ def render_ascii_trace(
     step = max(1, len(trace_ma) // 80)
     for idx in range(0, len(trace_ma), step):
         val = trace_ma[idx]
-        t_ms = idx * sample_ms
+        t_ms = int(round(idx * float(sample_ms)))
         bar_len = int(round((max(0.0, val) / peak) * width))
         bar = "#" * bar_len
         marker = ""
@@ -284,6 +581,13 @@ class TasmotaGatewayClient:
     def raw_stop(self) -> Dict[str, Any]:
         return self.send_command("RawStop")
 
+    def raw_result(self, offset: int = 0, limit: int = 200) -> Dict[str, Any]:
+        payload = json.dumps({"offset": int(offset), "limit": int(limit)}, separators=(",", ":"))
+        res = self.send_command(f"RawResult {payload}")
+        if "RawResult" not in res:
+            raise RuntimeError(f"Unexpected RawResult response: {res}")
+        return res["RawResult"]
+
     def raw_drive(
         self,
         ch: int,
@@ -291,7 +595,7 @@ class TasmotaGatewayClient:
         max_ms: int = 5000,
         cutoff_ma: float = 150.0,
         inrush_ms: int = 100,
-        sample_ms: int = 25,
+        sample_ms: int = 50,
     ) -> Dict[str, Any]:
         payload = json.dumps(
             {
@@ -309,7 +613,120 @@ class TasmotaGatewayClient:
             raise RuntimeError(f"Gateway returned error: {res['error']}")
         if "RawDrive" not in res:
             raise RuntimeError(f"Unexpected RawDrive response: {res}")
-        return res["RawDrive"]
+
+        drive_info = res["RawDrive"]
+        if drive_info.get("status") != "STARTED":
+            return drive_info
+
+        deadline = time.monotonic() + (max_ms / 1000.0) + 15.0
+        chunk_limit = 200
+        while True:
+            if time.monotonic() > deadline:
+                self.raw_stop()
+                raise RuntimeError(f"Timed out waiting for RawResult after {max_ms} ms")
+            rr = self.raw_result(offset=0, limit=chunk_limit)
+            status = rr.get("status")
+            if status == "DONE":
+                break
+            if status == "IDLE":
+                raise RuntimeError("Gateway reported IDLE while waiting for RawDrive result")
+            time.sleep(0.25)
+
+        trace_ma = list(rr.get("trace_ma", []))
+        trace_len = int(rr.get("trace_len", len(trace_ma)))
+        while len(trace_ma) < trace_len:
+            next_rr = self.raw_result(offset=len(trace_ma), limit=chunk_limit)
+            chunk = next_rr.get("trace_ma", [])
+            if not chunk:
+                break
+            trace_ma.extend(chunk)
+
+        rr["trace_ma"] = trace_ma
+        return rr
+
+    def raw_drive_auto(
+        self,
+        ch: int,
+        direction: str,
+        detector: Any,
+        safe_max_ma: float = 120.0,
+        max_ms: int = 60000,
+        inrush_ms: int = 500,
+        sample_ms: int = 50,
+        poll_s: float = 0.15,
+        live_output: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Start RawDrive with a hardware safety limit (`safe_max_ma`) and stream
+        `trace_ma` chunks live into `detector.feed(val)`. Immediately issues
+        `RawStop` when the detector signals an automatic end-stop.
+        """
+        payload = json.dumps(
+            {
+                "ch": ch,
+                "dir": direction,
+                "max_ms": int(max_ms),
+                "cutoff_ma": round(float(safe_max_ma), 1),
+                "inrush_ms": int(inrush_ms),
+                "sample_ms": int(sample_ms),
+            },
+            separators=(",", ":"),
+        )
+        res = self.send_command(f"RawDrive {payload}")
+        if "error" in res:
+            raise RuntimeError(f"Gateway returned error: {res['error']}")
+        if "RawDrive" not in res:
+            raise RuntimeError(f"Unexpected RawDrive response: {res}")
+
+        deadline = time.monotonic() + (max_ms / 1000.0) + 15.0
+        chunk_limit = 200
+        trace_ma: List[float] = []
+        auto_stop: Optional[Dict[str, Any]] = None
+        rr: Dict[str, Any] = {}
+
+        while True:
+            if time.monotonic() > deadline:
+                self.raw_stop()
+                raise RuntimeError(f"Timed out waiting for RawResult after {max_ms} ms")
+
+            rr = self.raw_result(offset=len(trace_ma), limit=chunk_limit)
+            status = rr.get("status")
+            if status == "IDLE":
+                raise RuntimeError("Gateway reported IDLE while waiting for RawDrive result")
+
+            chunk = rr.get("trace_ma", [])
+            for val in chunk:
+                fval = float(val)
+                idx = len(trace_ma)
+                trace_ma.append(fval)
+                if live_output:
+                    print(f"  {idx:4d} | {fval:6.1f} mA", flush=True)
+                if auto_stop is None:
+                    hit = detector.feed(fval)
+                    if hit is not None:
+                        auto_stop = hit
+                        self.raw_stop()
+                        break
+
+            if auto_stop is not None:
+                # Fetch final metadata & any remaining samples after RawStop
+                time.sleep(0.1)
+                rr = self.raw_result(offset=len(trace_ma), limit=chunk_limit)
+                tail = rr.get("trace_ma", [])
+                trace_ma.extend(float(v) for v in tail)
+                break
+
+            if status == "DONE" and len(trace_ma) >= int(rr.get("trace_len", len(trace_ma))):
+                break
+
+            if len(chunk) < chunk_limit:
+                time.sleep(poll_s)
+
+        rr["trace_ma"] = trace_ma
+        if auto_stop is not None:
+            rr["stop_reason"] = auto_stop["reason"]
+            rr["auto_stop"] = auto_stop
+        return rr
 
     def status_sensors(self) -> Dict[str, Any]:
         return self.send_command("Status 10")
@@ -369,7 +786,7 @@ def run_auto_profile_pulse(
     initial_dir: str = "open",
     pulse_ms: int = 1500,
     inrush_ms: int = 100,
-    sample_ms: int = 25,
+    sample_ms: int = 50,
     trace_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
     """
@@ -439,133 +856,180 @@ def run_calibrate(
     ch: int,
     profile_path: Path,
     trace_dir: Path,
-    inrush_ms: int = 125,
-    sample_ms: int = 25,
+    safe_max_ma: float = 120.0,
+    sample_ms: int = 50,
+    max_ms: int = 60000,
+    live_output: bool = False,
 ) -> int:
-    print(f"=== 3-Point Valve Calibration: Channel {ch} on {client.host} ===")
-
-    # 1. Auto-profile pulse
-    stats = run_auto_profile_pulse(
-        client=client,
-        ch=ch,
-        initial_dir="open",
-        pulse_ms=1500,
-        inrush_ms=inrush_ms,
-        sample_ms=sample_ms,
-        trace_dir=trace_dir,
+    print(
+        f"=== Automatic Threshold-Free Valve Calibration: Channel {ch} on {client.host} "
+        f"(safe_max={safe_max_ma:.1f} mA) ==="
     )
-    time.sleep(0.4)
 
-    # 2. Drive to upper mechanical stop (t = 0 reference)
-    print(f"\n[Step 2] Driving to upper mechanical stop (dir='open', cutoff={stats['i_stall_open_ma']:.1f} mA)...")
-    res_top = client.raw_drive(
+    # 0. Homing to upper mechanical stop (auto-detects stall or already-at-top)
+    print("\n[Step 0] Homing to TOP (dir='open', auto stall detection)...")
+    home_det = LiveOpenStallDetector()
+    res_home = client.raw_drive_auto(
         ch=ch,
         direction="open",
-        max_ms=35000,
-        cutoff_ma=stats["i_stall_open_ma"],
-        inrush_ms=inrush_ms,
+        detector=home_det,
+        safe_max_ma=safe_max_ma,
+        max_ms=max_ms,
+        inrush_ms=500,
         sample_ms=sample_ms,
+        live_output=live_output,
     )
-    save_trace(trace_dir, "homing_open", res_top)
+    save_trace(trace_dir, "homing_open", res_home)
     print(
-        f"  -> Reached upper stop: reason={res_top['stop_reason']}, "
-        f"elapsed={res_top['elapsed_ms']} ms, peak={res_top['peak_ma']:.1f} mA"
+        f"  -> Homing stopped: reason={res_home['stop_reason']}, "
+        f"elapsed={res_home['elapsed_ms']} ms, peak={res_home['peak_ma']:.1f} mA, "
+        f"samples={len(res_home.get('trace_ma', []))}"
     )
-    if res_top["stop_reason"] != "CURRENT_CUTOFF":
-        print(f"[WARN] Upper stop did not trigger CURRENT_CUTOFF (reason={res_top['stop_reason']}).")
     time.sleep(0.5)
 
-    # 3. Full closing stroke: measure t_touch (u = 100%) and t_close (u = 0%)
-    print(
-        f"\n[Step 3] Full closing stroke (dir='close', cutoff={stats['i_stall_close_ma']:.1f} mA) "
-        "to detect Touch-Point and closed end-stop..."
-    )
-    res_close = client.raw_drive(
+    # 1. Full closing stroke: auto-detects hard valve seat via dI/dt spike over linear ramp
+    print("\n[Step 1] Full closing stroke (dir='close', auto seat detection)...")
+    close_det = LiveCloseSeatDetector()
+    res_close = client.raw_drive_auto(
         ch=ch,
         direction="close",
-        max_ms=35000,
-        cutoff_ma=stats["i_stall_close_ma"],
-        inrush_ms=inrush_ms,
+        detector=close_det,
+        safe_max_ma=safe_max_ma,
+        max_ms=max_ms,
+        inrush_ms=500,
         sample_ms=sample_ms,
+        live_output=live_output,
     )
-    close_trace_file = save_trace(trace_dir, "cal_close", res_close)
+    close_file = save_trace(trace_dir, "cal_close", res_close)
     close_trace = res_close.get("trace_ma", [])
     t_close_ms = int(res_close.get("elapsed_ms", len(close_trace) * sample_ms))
-
-    # Re-evaluate free-run stats from the first subtle part of the close stroke if enough samples exist,
-    # otherwise use the pulse stats.
-    touch = detect_touch_point(
-        trace_ma=close_trace,
-        i_free_ma=stats["i_free_ma"],
-        delta_i_touch_ma=stats["delta_i_touch_ma"],
-        sample_ms=sample_ms,
-        inrush_ms=max(150, inrush_ms),
+    dt_close_ms = float(t_close_ms) / max(1, len(close_trace))
+    print(
+        f"  -> Close stopped: reason={res_close['stop_reason']}, "
+        f"elapsed={t_close_ms} ms, peak={res_close['peak_ma']:.1f} mA, "
+        f"samples={len(close_trace)} (dt={dt_close_ms:.1f} ms)"
     )
 
-    if touch is None:
-        print("\n" + render_ascii_trace(close_trace, sample_ms=sample_ms))
+    knee = detect_touch_point_knee(trace_ma=close_trace, elapsed_ms=t_close_ms)
+    if knee is None:
+        print("\n" + render_ascii_trace(close_trace, sample_ms=dt_close_ms))
         raise RuntimeError(
-            "Could not detect a Touch-Point during closing stroke! "
-            "Is the actuator mounted on a valve? Trace saved to " + str(close_trace_file)
+            "Could not fit a Touch-Point knee on closing stroke! "
+            f"Is the actuator mounted on a valve? Trace saved to {close_file}"
         )
 
-    touch_idx, t_touch_ms, touch_avg_ma = touch
+    touch_idx = int(knee["touch_idx"])
+    t_touch_ms = int(knee["t_touch_ms"])
+    i_free_close_ma = float(knee["i_free_close_ma"])
+    # Learn permanent close cutoff from predicted ramp end (or live auto-stop pred)
+    seat_pred_ma = float(res_close.get("auto_stop", {}).get("pred_ma", knee["seat_pred_ma"]))
+    i_stall_close_ma = round(min(safe_max_ma, max(seat_pred_ma + 8.0, seat_pred_ma * 1.08)), 1)
+
     print(
-        f"  -> Touch-Point (u=100%) detected at t_touch = {t_touch_ms} ms "
-        f"(sample #{touch_idx}, 5-sample avg = {touch_avg_ma:.1f} mA)"
+        f"  -> Knee Touch-Point (u=100%): t_touch={t_touch_ms} ms (sample #{touch_idx}), "
+        f"I_free_close={i_free_close_ma:.2f} mA, slope={knee['ramp_slope_ma_per_s']:.2f} mA/s, "
+        f"RMSE={knee['rmse_ma']:.2f} mA"
     )
-    print(
-        f"  -> Closed stop (u=0%) reached at t_close = {t_close_ms} ms "
-        f"(reason={res_close['stop_reason']}, peak={res_close['peak_ma']:.1f} mA)"
-    )
+    print(f"  -> Learned I_stall_close = {i_stall_close_ma:.1f} mA (seat_pred={seat_pred_ma:.1f} mA)")
     print("\n--- Closing Stroke Current Profile ---")
     print(
         render_ascii_trace(
             close_trace,
-            sample_ms=sample_ms,
+            sample_ms=dt_close_ms,
             touch_idx=touch_idx,
-            threshold_ma=stats["touch_threshold_ma"],
+            threshold_ma=i_stall_close_ma,
         )
     )
     time.sleep(0.5)
 
-    # 4. Full opening stroke: measure t_open_total from 0% to upper stop
-    print(f"\n[Step 4] Full opening stroke (dir='open', cutoff={stats['i_stall_open_ma']:.1f} mA)...")
-    res_open = client.raw_drive(
+    # 2. Full opening stroke: measure t_open_total and learn I_free_open / I_stall_open
+    print("\n[Step 2] Full opening stroke (dir='open', auto stall detection)...")
+    open_det = LiveOpenStallDetector()
+    res_open = client.raw_drive_auto(
         ch=ch,
         direction="open",
-        max_ms=35000,
-        cutoff_ma=stats["i_stall_open_ma"],
-        inrush_ms=inrush_ms,
+        detector=open_det,
+        safe_max_ma=safe_max_ma,
+        max_ms=max_ms,
+        inrush_ms=500,
         sample_ms=sample_ms,
+        live_output=live_output,
     )
     save_trace(trace_dir, "cal_open", res_open)
-    t_open_total_ms = int(res_open.get("elapsed_ms", len(res_open.get("trace_ma", [])) * sample_ms))
+    open_trace = res_open.get("trace_ma", [])
+    t_open_total_ms = int(res_open.get("elapsed_ms", len(open_trace) * sample_ms))
+    dt_open_ms = float(t_open_total_ms) / max(1, len(open_trace))
+    i_free_open_ma, sigma_open_ma = open_det.baseline_stats()
+    i_stall_open_ma = round(max(2.1 * i_free_open_ma, i_free_open_ma + max(18.0, 4.5 * sigma_open_ma)), 1)
+
+    open_knee = detect_open_liftoff_knee(trace_ma=open_trace, elapsed_ms=t_open_total_ms)
+    liftoff_idx = int(open_knee["liftoff_idx"]) if open_knee else None
+
     print(
-        f"  -> Upper stop reached at t_open_total = {t_open_total_ms} ms "
-        f"(reason={res_open['stop_reason']}, peak={res_open['peak_ma']:.1f} mA)"
+        f"  -> Open stopped: reason={res_open['stop_reason']}, "
+        f"elapsed={t_open_total_ms} ms, peak={res_open['peak_ma']:.1f} mA, "
+        f"samples={len(open_trace)} (dt={dt_open_ms:.1f} ms)"
+    )
+    print(
+        f"  -> Learned I_free_open = {i_free_open_ma:.2f} mA (sigma={sigma_open_ma:.2f} mA), "
+        f"I_stall_open = {i_stall_open_ma:.1f} mA"
+    )
+    if open_knee:
+        leer_diff_ms = abs(t_touch_ms - int(open_knee["t_leer_open_ms"]))
+        print(
+            f"  -> Open Lift-Off Knee (u=100%): T_hub_auf={open_knee['t_hub_auf_ms']} ms "
+            f"(sample #{liftoff_idx}), t_leer_open={open_knee['t_leer_open_ms']} ms, "
+            f"slope=-{open_knee['unload_slope_ma_per_s']:.2f} mA/s, RMSE={open_knee['rmse_ma']:.2f} mA"
+        )
+        print(
+            f"  -> Cross-check free-run gap: close={t_touch_ms} ms vs open={open_knee['t_leer_open_ms']} ms "
+            f"(diff={leer_diff_ms} ms)"
+        )
+    print("\n--- Opening Stroke Current Profile ---")
+    print(
+        render_ascii_trace(
+            open_trace,
+            sample_ms=dt_open_ms,
+            touch_idx=liftoff_idx,
+            threshold_ma=i_stall_open_ma,
+        )
     )
 
-    # 5. Move from upper mechanical stop down to Touch-Point (u = 100% ready state)
-    print(f"\n[Step 5] Positioning plunger from upper stop to Touch-Point (u=100%, {t_touch_ms} ms)...")
-    time.sleep(0.4)
-    client.raw_drive(
-        ch=ch,
-        direction="close",
-        max_ms=t_touch_ms,
-        cutoff_ma=stats["i_stall_close_ma"],
-        inrush_ms=inrush_ms,
-        sample_ms=sample_ms,
-    )
+    # 3. Position plunger from upper stop down to Touch-Point (u = 100%)
+    if t_touch_ms > 0:
+        print(f"\n[Step 3] Positioning plunger from upper stop to Touch-Point (u=100%, {t_touch_ms} ms)...")
+        time.sleep(0.4)
+        client.raw_drive(
+            ch=ch,
+            direction="close",
+            max_ms=t_touch_ms,
+            cutoff_ma=i_stall_close_ma,
+            inrush_ms=1000,
+            sample_ms=sample_ms,
+        )
 
     cal_params = compute_calibration_parameters(
         t_touch_ms=t_touch_ms,
         t_close_ms=t_close_ms,
         t_open_total_ms=t_open_total_ms,
     )
+    if open_knee:
+        # Use directly measured spring-assisted opening stroke duration instead of eta_work * t_open_total
+        cal_params["t_hub_auf_ms"] = float(open_knee["t_hub_auf_ms"])
+        cal_params["t_leer_open_ms"] = int(open_knee["t_leer_open_ms"])
 
     channel_record = {
-        **stats,
+        "i_free_open_ma": round(i_free_open_ma, 3),
+        "sigma_open_ma": round(sigma_open_ma, 3),
+        "i_free_close_ma": round(i_free_close_ma, 3),
+        "ramp_slope_ma_per_s": knee["ramp_slope_ma_per_s"],
+        "knee_rmse_ma": knee["rmse_ma"],
+        "open_knee_rmse_ma": open_knee["rmse_ma"] if open_knee else None,
+        "i_stall_open_ma": i_stall_open_ma,
+        "i_stall_close_ma": i_stall_close_ma,
+        "safe_max_ma": safe_max_ma,
+        "dt_close_ms": round(dt_close_ms, 2),
+        "dt_open_ms": round(dt_open_ms, 2),
         **cal_params,
         "current_pos_pct": 100.0,
         "calibrated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -588,7 +1052,7 @@ def run_set_position(
     target_pct: float,
     profile_path: Path,
     inrush_ms: int = 125,
-    sample_ms: int = 25,
+    sample_ms: int = 50,
 ) -> int:
     profile = load_valve_profile(profile_path)
     ch_key = str(ch)
@@ -607,12 +1071,14 @@ def run_set_position(
         f"Moving channel {ch}: {u_old:.1f}% -> {plan['target_pct']:.1f}% "
         f"(action={plan['action']}, dir={plan['dir']}, max_ms={plan['max_ms']}, cutoff={plan['cutoff_ma']:.1f} mA)"
     )
+    # Opening out of a closed valve seat needs longer breakaway blanking (~2s)
+    eff_inrush_ms = 2000 if (plan["dir"] == "open" and u_old <= 5.0) else max(inrush_ms, 1000)
     res = client.raw_drive(
         ch=ch,
         direction=plan["dir"],
         max_ms=plan["max_ms"],
         cutoff_ma=plan["cutoff_ma"],
-        inrush_ms=inrush_ms,
+        inrush_ms=eff_inrush_ms,
         sample_ms=sample_ms,
     )
     print(
@@ -678,8 +1144,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_pulse.add_argument("--dir", default="open", choices=["open", "close"], help="Initial pulse direction")
     p_pulse.add_argument("--max-ms", type=int, default=1500, help="Pulse duration in ms (default: 1500)")
 
-    p_cal = sub.add_parser("calibrate", help="Run full 3-point calibration and save to valve_profile.json")
+    p_cal = sub.add_parser(
+        "calibrate",
+        help="Run automatic threshold-free valve calibration and save to valve_profile.json",
+    )
     p_cal.add_argument("--ch", type=int, required=True, choices=[1, 2, 3, 4], help="Valve channel (1..4)")
+    p_cal.add_argument(
+        "--safe-max-ma",
+        type=float,
+        default=120.0,
+        help="Hardware safety cutoff current in mA (default: 120.0)",
+    )
+    p_cal.add_argument("--max-ms", type=int, default=60000, help="Max drive duration per stroke in ms (default: 60000)")
+    p_cal.add_argument("--live", action="store_true", help="Print current samples live line-by-line during calibration")
 
     p_pos = sub.add_parser("set-pos", help="Move calibrated channel to target opening percentage (0..100)")
     p_pos.add_argument("--ch", type=int, required=True, choices=[1, 2, 3, 4], help="Valve channel (1..4)")
@@ -714,6 +1191,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ch=args.ch,
             profile_path=args.profile,
             trace_dir=args.trace_dir,
+            safe_max_ma=args.safe_max_ma,
+            max_ms=args.max_ms,
+            live_output=args.live,
         )
     if args.subcommand == "set-pos":
         return run_set_position(

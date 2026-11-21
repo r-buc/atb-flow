@@ -51,9 +51,14 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
 
 ---
 
-## 🔧 CLI-Tools (`tools/`)
+## 🔧 CLI-Tools (`tools/`) & On-Device-Commands
 
-* **`tools/profile_valve.py`** – Remote Auto-Profiling & 3-Punkt-Ventilkalibrierung über das ESP32-S3 Tasmota-Gateway.
+* **On-Device Tasmota-Commands (`gateway.be` + `valve_cal.be`)**:
+  * `ValveCal <ch>` – Vollautomatische, schwellwertfreie Kalibrierung direkt auf dem ESP32-S3 (Homing, Schließ-/Öffnungshub mit `O(N)`-Kniepunkt-Erkennung, Persistenz in `valve_profile.json`).
+  * `ValvePos {"ch":1,"pos":50}` – Stetige Ventilpositionierung ($0\text{--}100\,\%$) inkl. Endlagen-Drift-Eliminierung.
+  * `ValveStatus [ch]` – Aktueller Status und gespeicherte Kanalprofile.
+* **`tools/profile_valve.py`** – Remote Auto-Profiling & schwellwertfreie Ventilkalibrierung inkl. ASCII-Stromprofil und Trace-Export über das ESP32-S3 Tasmota-Gateway.
+* **`tools/drive_valve.py`** – Minimales Live-CLI zum direkten Auf-/Zufahren eines Kanals mit zeilenweiser Stromausgabe und automatischem Cutoff.
 * **`tools/telink_mi_flasher.py`** – Linux-CLI-Port von `pvvx/TelinkMiFlasher.html` (inkl. Xiaomi-Firmware `2.1.1_0159` Mi-Token-Login & `sign_2.1.1_0159c.bin` OTA-Unlock):
   ```bash
   pip install bleak

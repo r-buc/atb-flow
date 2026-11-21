@@ -90,6 +90,17 @@ class MockTasmota
         self._timers.push({'t': self._epoch_ms + ms, 'cb': cb})
     end
 
+    def run_timers()
+        while size(self._timers) > 0
+            var next_t = self._timers[0]
+            self._timers.remove(0)
+            if next_t['t'] > self._epoch_ms
+                self._epoch_ms = next_t['t']
+            end
+            next_t['cb']()
+        end
+    end
+
     def wifi(key)
         var info = {'ip': '192.168.1.50', 'mac': 'AA:BB:CC:DD:EE:FF'}
         if key != nil return info[key] end
