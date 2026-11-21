@@ -492,5 +492,221 @@ class TestEndToEndBle2110159Mock(unittest.TestCase):
             )
 
 
+class _FakeCustomPvvxDeviceClient:
+    """
+    Simulates a LYWSD03MMC running custom pvvx/ATC firmware (`0x1f10` / `0x1f1f`)
+    so `probe_device_profile` and `configure_connected_device` can be tested end-to-end.
+    """
+
+    def __init__(self, initial_cfg: Optional[bytes] = None) -> None:
+        self.is_connected = True
+        self.c_ota = _FakeChar(tmf.UUID_CHR_TELINK_OTA, ("read", "write-without-response"))
+        self.c_cfg = _FakeChar(tmf.UUID_CHR_CUSTOM_CFG, ("read", "write", "write-without-response", "notify"))
+        self.c_fw = _FakeChar(tmf.UUID_CHR_FW_REV, ("read",))
+        self.c_hw = _FakeChar(tmf.UUID_CHR_HW_REV, ("read",))
+        self.c_sw = _FakeChar(tmf.UUID_CHR_SW_REV, ("read",))
+
+        self.services = _FakeServiceCollection(
+            [
+                _FakeService(tmf.UUID_SVC_TELINK_OTA, [self.c_ota]),
+                _FakeService(tmf.UUID_SVC_CUSTOM, [self.c_cfg]),
+                _FakeService(tmf.UUID_SVC_DEV_INFO, [self.c_fw, self.c_hw, self.c_sw]),
+            ]
+        )
+        self._strings = {
+            tmf.UUID_CHR_FW_REV: b"pvvx v5.5",
+            tmf.UUID_CHR_HW_REV: b"B1.4",
+            tmf.UUID_CHR_SW_REV: b"0055",
+        }
+        # Default v5.5 config: flg=0x01 (PVVX), flg2=0x00, adv_delay=10, event_cnt=6,
+        # adv_int=40 (2500ms), meas_int=4, rf_tx=191, latency=49, lcd_tint=55, hver=0, mem=60
+        self.cfg_pkt = bytearray(
+            initial_cfg
+            or bytes([0x55, 0x55, 0x01, 0x00, 10, 6, 40, 4, 191, 49, 55, 0, 60])
+        )
+        self.default_cfg_pkt = bytearray([0x55, 0x55, 0x01, 0x10, 10, 6, 40, 4, 191, 49, 55, 0, 60])
+        self.dev_name = b"ATC_112233"
+        self.bindkey = bytes.fromhex("00112233445566778899aabbccddeeff")
+        self.sensor_cal = (10000, 0, 10000, 0)
+        self.sent_cmds: List[bytes] = []
+        self._notify_cb: Optional[Callable[[Any, bytearray], None]] = None
+
+    async def start_notify(self, char: _FakeChar, cb: Callable[[Any, bytearray], None]) -> None:
+        if char.uuid.lower() == tmf.UUID_CHR_CUSTOM_CFG:
+            self._notify_cb = cb
+
+    async def stop_notify(self, char: _FakeChar) -> None:
+        if char.uuid.lower() == tmf.UUID_CHR_CUSTOM_CFG:
+            self._notify_cb = None
+
+    async def read_gatt_char(self, char: _FakeChar) -> bytearray:
+        return bytearray(self._strings.get(char.uuid.lower(), b""))
+
+    def _emit(self, data: bytes) -> None:
+        if self._notify_cb is not None:
+            asyncio.get_running_loop().call_soon(self._notify_cb, self.c_cfg, bytearray(data))
+
+    async def write_gatt_char(self, char: _FakeChar, data: bytes, response: bool = False) -> None:
+        cmd = bytes(data)
+        self.sent_cmds.append(cmd)
+        if not cmd:
+            return
+        op = cmd[0]
+        if op == 0x55:
+            if len(cmd) >= 10:
+                self.cfg_pkt[2 : 2 + len(cmd) - 1] = cmd[1:]
+            self._emit(bytes(self.cfg_pkt))
+        elif op == 0x56:
+            self.cfg_pkt = bytearray(self.default_cfg_pkt)
+            self._emit(bytes(self.cfg_pkt))
+        elif op == 0x01:
+            if len(cmd) == 2 and cmd[1] == 0:
+                self.dev_name = b"ATC_112233"
+            elif len(cmd) > 1:
+                self.dev_name = cmd[1:]
+            self._emit(b"\x01" + self.dev_name)
+        elif op == 0x18:
+            if len(cmd) >= 17:
+                self.bindkey = cmd[1:17]
+            self._emit(b"\x18" + self.bindkey)
+        elif op == 0x23:
+            t_val = struct.unpack_from("<I", cmd, 1)[0] if len(cmd) >= 5 else 1763750000
+            self._emit(struct.pack("<BII", 0x23, t_val, t_val))
+        elif op == 0x25:
+            if len(cmd) >= 13:
+                tk, hk, tz, hz = struct.unpack_from("<IIhh", cmd, 1)
+                self.sensor_cal = (tk, tz, hk, hz)
+            tk, tz, hk, hz = self.sensor_cal
+            self._emit(struct.pack("<BIIhhIBB", 0x25, tk, hk, tz, hz, 0x12345678, 0x88, 3))
+        elif op == 0x26:
+            self.sensor_cal = (10000, 0, 10000, 0)
+            self._emit(struct.pack("<BIIhhIBB", 0x26, 10000, 10000, 0, 0, 0x12345678, 0x88, 3))
+
+    async def disconnect(self) -> None:
+        self.is_connected = False
+
+
+class TestPvvxConfiguration(unittest.TestCase):
+    def test_pvvx_config_parse_and_roundtrip(self) -> None:
+        raw = bytes([0x55, 0x55, 0x43, 0x90, 10, 6, 40, 4, 191, 49, 55, 0, 60])
+        cfg = tmf.PvvxConfig.from_bytes(raw)
+        self.assertEqual(cfg.ver_str, "5.5")
+        self.assertEqual(cfg.adv_type, "bthome2")
+        self.assertTrue(cfg.tx_measures)
+        self.assertTrue(cfg.adv_flags)
+        self.assertTrue(cfg.screen_off)
+        self.assertEqual(cfg.adv_interval_ms, 2500.0)
+        self.assertEqual(cfg.measure_interval_s, 10.0)
+        self.assertEqual(cfg.connect_latency_ms, 1000)
+        self.assertEqual(cfg.lcd_refresh_s, 2.75)
+
+        out = cfg.to_set_packet()
+        self.assertEqual(len(out), 12)
+        self.assertEqual(out[0], 0x55)
+        self.assertEqual(out[1:], raw[2:])
+
+    def test_pvvx_config_old_version_9_byte_payload_and_offsets(self) -> None:
+        # Firmware v1.9 (< 0x20) uses 10-byte write (0x55 + 9 bytes) and 0.1 offsets
+        raw = struct.pack("<BBBBbbBBBB", 0x55, 0x19, 0x01, 0x00, -5, 12, 32, 4, 191, 49) + bytes([55])
+        cfg = tmf.PvvxConfig.from_bytes(raw)
+        self.assertEqual(cfg.ver_str, "1.9")
+        self.assertAlmostEqual(cfg.temp_offset_c, -0.5)
+        self.assertAlmostEqual(cfg.humi_offset_pct, 1.2)
+        tmf.apply_pvvx_config_updates(cfg, {"temp_offset": -1.3, "humi_offset": 2.4, "adv_type": "atc1441"})
+        self.assertEqual(cfg.adv_type, "atc1441")
+        self.assertAlmostEqual(cfg.temp_offset_c, -1.3)
+        self.assertAlmostEqual(cfg.humi_offset_pct, 2.4)
+        pkt = cfg.to_set_packet()
+        self.assertEqual(len(pkt), 10)  # 0x55 + 9 bytes for ver < 0x20
+
+    def test_pvvx_config_non_lcd_pre_48_adv_type_mapping(self) -> None:
+        # Non-LCD device (e.g. hwver_id=18) on fw 4.6 has 0=bthome2, 3=bthome1
+        raw = bytes([0x55, 0x46, 0x01, 0x00, 0, 0, 40, 4, 191, 49, 2, 0x0F, 60])
+        cfg = tmf.PvvxConfig.from_bytes(raw)
+        self.assertEqual(cfg.hwver_id, 18)
+        self.assertFalse(cfg.has_lcd_ui)
+        cfg.set_adv_type("bthome2")
+        self.assertEqual(cfg.flg & 0x03, 0)
+        self.assertEqual(cfg.adv_type, "bthome2")
+
+    def test_secondary_packet_builders(self) -> None:
+        self.assertEqual(tmf.build_dev_name_packet(None), b"\x01\x00")
+        self.assertEqual(tmf.build_dev_name_packet("Wohnzimmer"), b"\x01Wohnzimmer")
+        with self.assertRaises(ValueError):
+            tmf.build_dev_name_packet("A" * 19)
+
+        self.assertEqual(
+            tmf.build_bindkey_packet("0011:2233-445566778899AABBCCDDEEFF"),
+            b"\x18" + bytes.fromhex("00112233445566778899aabbccddeeff"),
+        )
+        self.assertEqual(tmf.build_pincode_packet("123456"), struct.pack("<BI", 0x70, 123456))
+        with self.assertRaises(ValueError):
+            tmf.build_pincode_packet("12345")
+
+        t_pkt = tmf.build_sync_time_packet(1763753600)
+        self.assertEqual(t_pkt, struct.pack("<BI", 0x23, 1763753600))
+
+        c_pkt = tmf.build_comfort_packet(20.0, 25.5, 35.0, 60.0)
+        self.assertEqual(c_pkt, struct.pack("<Bhhhh", 0x20, 2000, 2550, 3500, 6000))
+
+        s_pkt = tmf.build_sensor_cal_packet(100.0, -0.35, 100.0, 1.25)
+        self.assertEqual(s_pkt, struct.pack("<BIIhh", 0x25, 10000, 10000, -35, 125))
+
+    def test_end_to_end_custom_config_over_mock_gatt(self) -> None:
+        fake = _FakeCustomPvvxDeviceClient()
+        prof = asyncio.run(tmf.probe_device_profile(fake, "A4:C1:38:11:22:33", "ATC_112233"))
+        self.assertTrue(prof.custom_enabled)
+        self.assertIsNotNone(prof.pvvx_config)
+        self.assertEqual(prof.pvvx_config.adv_type, "pvvx")
+
+        updates = {
+            "reset_default": True,
+            "preset": "atb-flow",
+            "screen_off": True,
+            "temp_unit": "C",
+            "rf_tx_power": 189,
+            "set_name": "Bad_Sensor",
+            "sync_time": True,
+            "sensor_cal": (100.0, -0.25, 100.0, 0.5),
+            "get_bindkey": True,
+        }
+        res = asyncio.run(tmf.configure_connected_device(fake, prof, updates, log=lambda _s: None))
+        self.assertEqual(res["config"]["adv_type"], "bthome2")
+        self.assertFalse(res["config"]["encrypted"])
+        self.assertTrue(res["config"]["adv_flags"])
+        self.assertTrue(res["config"]["screen_off"])
+        self.assertEqual(res["config"]["adv_interval_ms"], 2500.0)
+        self.assertEqual(res["config"]["measure_interval"], 4)
+        self.assertEqual(res["config"]["rf_tx_power"], 189)
+        self.assertEqual(res["dev_name"], "Bad_Sensor")
+        self.assertEqual(res["bindkey"], "00112233445566778899aabbccddeeff")
+        self.assertAlmostEqual(res["sensor_cal"]["temp_z"], -0.25)
+        self.assertAlmostEqual(res["sensor_cal"]["humi_z"], 0.5)
+        self.assertTrue(res["time_synced"])
+        self.assertEqual(fake.sent_cmds[1], b"\x56")
+
+    def test_cli_config_parser(self) -> None:
+        parser = tmf.build_arg_parser()
+        args = parser.parse_args(
+            [
+                "config",
+                "--mac",
+                "A4:C1:38:11:22:33",
+                "--preset",
+                "atb-flow",
+                "--screen-off",
+                "on",
+                "--adv-interval-ms",
+                "2500",
+                "--sync-time",
+            ]
+        )
+        updates = tmf._extract_config_updates(args)
+        self.assertEqual(updates["preset"], "atb-flow")
+        self.assertTrue(updates["screen_off"])
+        self.assertEqual(updates["adv_interval_ms"], 2500.0)
+        self.assertTrue(updates["sync_time"])
+
+
 if __name__ == "__main__":
     unittest.main()

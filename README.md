@@ -75,7 +75,12 @@ Die Hardwarekosten bei 4 HKV und 12 Heizkreisen liegen bei unter 400 €.
   python3 tools/telink_mi_flasher.py flash --mac A4:C1:38:XX:XX:XX --tokens-file tokens.json
 
   # Für neuere 2025er Hardware-Revisionen (B1.5 / B1.6 / B1.1) im 2-Stufen-Modus:
-  python3 tools/telink_mi_flasher.py flash --mac A4:C1:38:XX:XX:XX --tokens-file tokens.json --two-stage
+  python3 tools/telink_mi_flasher.py flash --mac A4:C1:38:XX:XX:XX --tokens-file tokens.json --two-stage --config-preset atb-flow
+
+  # Konfiguration auslesen / für ATB-Flow setzen (BTHome v2, unverschlüsselt, AdFlags, 2500 ms / 10 s):
+  python3 tools/telink_mi_flasher.py config --mac A4:C1:38:XX:XX:XX
+  python3 tools/telink_mi_flasher.py config --mac A4:C1:38:XX:XX:XX --preset atb-flow --sync-time
+  python3 tools/telink_mi_flasher.py config --all-lywsd03mmc --tokens-file tokens.json --preset atb-flow --sync-time
   ```
 
 ---

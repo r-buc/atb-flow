@@ -48,6 +48,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -165,6 +166,396 @@ class FirmwareInfo:
 
 
 @dataclasses.dataclass
+class PvvxConfig:
+    """
+    Decoded representation of pvvx/ATC custom firmware `0x55` config block
+    (matching `CustomBlkParse` and `SendCustomConfig` in TelinkMiFlasher.html).
+    """
+
+    ver: int
+    flg: int
+    flg2: int
+    temp_offset: int  # signed int8 (-128..127); for ver > 0x50 low nibble = adv_delay
+    humi_offset: int  # signed int8 (-128..127); for ver > 0x50 unsigned = event_adv_cnt
+    advertising_interval: int  # 1..255 in 62.5 ms steps
+    measure_interval: int  # 1..255 multiplier of advertising_interval
+    rf_tx_power: int  # 23..63 (VBAT) or 130..191 (VANT)
+    connect_latency: int  # 0..49 (ver > 0x40) or 0..200, in (x+1)*20 ms
+    lcd_tint: int = 55  # 10..255 in 0.05 s steps
+    hver: int = 0x80
+    av_meas_mem: int = 0  # 0..255
+
+    @classmethod
+    def from_bytes(cls, pkt: bytes) -> "PvvxConfig":
+        if len(pkt) < 10 or pkt[0] != 0x55:
+            raise ValueError(
+                f"Invalid pvvx 0x55 config packet (len={len(pkt)}, header=0x{pkt[0]:02x})."
+            )
+        ver = pkt[1]
+        flg = pkt[2]
+        flg2 = pkt[3]
+        temp_offset, humi_offset = struct.unpack_from("<bb", pkt, 4)
+        adv_int = pkt[6]
+        meas_int = pkt[7]
+        rf_tx = pkt[8]
+        con_lat = pkt[9]
+        lcd_tint = pkt[10] if len(pkt) >= 11 else 55
+        if len(pkt) >= 12:
+            hver = pkt[11]
+            if ver < 0x36:
+                hver &= 0x87
+        else:
+            hver = 0x80
+        av_meas_mem = pkt[12] if len(pkt) >= 13 else 0
+        return cls(
+            ver=ver,
+            flg=flg,
+            flg2=flg2,
+            temp_offset=temp_offset,
+            humi_offset=humi_offset,
+            advertising_interval=adv_int,
+            measure_interval=meas_int,
+            rf_tx_power=rf_tx,
+            connect_latency=con_lat,
+            lcd_tint=lcd_tint,
+            hver=hver,
+            av_meas_mem=av_meas_mem,
+        )
+
+    def to_set_packet(self) -> bytes:
+        base = struct.pack(
+            "<BBBbbBBBB",
+            0x55,
+            self.flg & 0xFF,
+            self.flg2 & 0xFF,
+            max(-128, min(127, int(self.temp_offset))),
+            max(-128, min(127, int(self.humi_offset))),
+            max(1, min(255, int(self.advertising_interval))),
+            max(1, min(255, int(self.measure_interval))),
+            self.rf_tx_power & 0xFF,
+            self.connect_latency & 0xFF,
+        )
+        lcd = max(10, min(255, int(self.lcd_tint))) & 0xFF
+        if self.ver < 0x20:
+            return base + bytes([lcd])
+        return base + bytes([lcd, self.hver & 0xFF, max(0, min(255, int(self.av_meas_mem))) & 0xFF])
+
+    @property
+    def ver_str(self) -> str:
+        return f"{self.ver >> 4}.{self.ver & 0x0F}"
+
+    @property
+    def hwver_id(self) -> int:
+        if self.ver < 0x48:
+            hid = self.hver & 0x0F
+            if hid == 0x0F:
+                return 16 + (self.lcd_tint & 0x7F)
+            return hid
+        return self.hver
+
+    @property
+    def has_lcd_ui(self) -> bool:
+        hid = self.hwver_id
+        return hid <= 15 or (30 <= hid <= 33) or hid in (38, 49, 52, 62)
+
+    @property
+    def is_clock_only_hw(self) -> bool:
+        return self.hwver_id in (9, 12, 49, 62)
+
+    def _adv_type_map(self) -> Dict[int, str]:
+        if not self.has_lcd_ui and self.ver < 0x48:
+            return {0: "bthome2", 1: "pvvx", 2: "mijia", 3: "bthome1"}
+        if self.ver >= 0x45:
+            last = "bthome2"
+        elif self.ver >= 0x37:
+            last = "bthome1"
+        else:
+            last = "all"
+        return {0: "atc1441", 1: "pvvx", 2: "mijia", 3: last}
+
+    @property
+    def adv_type(self) -> str:
+        return self._adv_type_map().get(self.flg & 0x03, str(self.flg & 0x03))
+
+    def set_adv_type(self, value: str) -> None:
+        v = value.strip().lower()
+        aliases = {
+            "atc": "atc1441",
+            "atc1441": "atc1441",
+            "pvvx": "pvvx",
+            "custom": "pvvx",
+            "mijia": "mijia",
+            "mi": "mijia",
+            "mihome": "mijia",
+            "bthome": "bthome2",
+            "bthome2": "bthome2",
+            "bthomev2": "bthome2",
+            "bthome1": "bthome1",
+            "bthomev1": "bthome1",
+            "all": "all",
+        }
+        if v in ("0", "1", "2", "3"):
+            code = int(v)
+        else:
+            canon = aliases.get(v)
+            if canon is None:
+                raise ValueError(f"Unknown advertising type '{value}'.")
+            rev_map = {name: k for k, name in self._adv_type_map().items()}
+            if canon not in rev_map:
+                raise ValueError(
+                    f"Advertising type '{value}' is not supported by custom firmware v{self.ver_str} "
+                    f"(supported: {', '.join(rev_map.keys())})."
+                )
+            code = rev_map[canon]
+        self.flg = (self.flg & ~0x03) | (code & 0x03)
+
+    @property
+    def comfort(self) -> bool:
+        return bool(self.flg & 0x04)
+
+    @comfort.setter
+    def comfort(self, enabled: bool) -> None:
+        self.flg = (self.flg | 0x04) if enabled else (self.flg & ~0x04)
+
+    @property
+    def blinking(self) -> bool:
+        return bool(self.flg & 0x08)
+
+    @blinking.setter
+    def blinking(self, enabled: bool) -> None:
+        self.flg = (self.flg | 0x08) if enabled else (self.flg & ~0x08)
+
+    @property
+    def temp_unit(self) -> str:
+        return "F" if (self.flg & 0x10) else "C"
+
+    @temp_unit.setter
+    def temp_unit(self, unit: str) -> None:
+        u = unit.strip().upper()
+        if u not in ("C", "F"):
+            raise ValueError(f"Invalid temperature unit '{unit}' (expected 'C' or 'F').")
+        self.flg = (self.flg | 0x10) if u == "F" else (self.flg & ~0x10)
+
+    @property
+    def show_batt(self) -> bool:
+        mask = 0x08 if self.hwver_id == 49 else 0x20
+        return bool(self.flg & mask)
+
+    @show_batt.setter
+    def show_batt(self, enabled: bool) -> None:
+        mask = 0x08 if self.hwver_id == 49 else 0x20
+        self.flg = (self.flg | mask) if enabled else (self.flg & ~mask)
+
+    @property
+    def tx_measures(self) -> bool:
+        return bool(self.flg & 0x40)
+
+    @tx_measures.setter
+    def tx_measures(self, enabled: bool) -> None:
+        self.flg = (self.flg | 0x40) if enabled else (self.flg & ~0x40)
+
+    @property
+    def lp_measures(self) -> bool:
+        return bool(self.flg & 0x80)
+
+    @lp_measures.setter
+    def lp_measures(self, enabled: bool) -> None:
+        self.flg = (self.flg | 0x80) if enabled else (self.flg & ~0x80)
+
+    @property
+    def smiley(self) -> int:
+        return self.flg2 & 0x07
+
+    @smiley.setter
+    def smiley(self, val: int) -> None:
+        if not 0 <= val <= 7:
+            raise ValueError("Smiley / screen type must be in range 0..7.")
+        self.flg2 = (self.flg2 & ~0x07) | (val & 0x07)
+
+    @property
+    def encrypted(self) -> bool:
+        return bool(self.flg2 & 0x08)
+
+    @encrypted.setter
+    def encrypted(self, enabled: bool) -> None:
+        self.flg2 = (self.flg2 | 0x08) if enabled else (self.flg2 & ~0x08)
+
+    @property
+    def adv_flags(self) -> bool:
+        return bool(self.flg2 & 0x10)
+
+    @adv_flags.setter
+    def adv_flags(self, enabled: bool) -> None:
+        self.flg2 = (self.flg2 | 0x10) if enabled else (self.flg2 & ~0x10)
+
+    @property
+    def bt5_phy(self) -> bool:
+        return bool(self.flg2 & 0x20)
+
+    @bt5_phy.setter
+    def bt5_phy(self, enabled: bool) -> None:
+        self.flg2 = (self.flg2 | 0x20) if enabled else (self.flg2 & ~0x20)
+
+    @property
+    def long_range(self) -> bool:
+        return bool(self.flg2 & 0x40)
+
+    @long_range.setter
+    def long_range(self, enabled: bool) -> None:
+        self.flg2 = (self.flg2 | 0x40) if enabled else (self.flg2 & ~0x40)
+
+    @property
+    def screen_off(self) -> bool:
+        return bool(self.flg2 & 0x80)
+
+    @screen_off.setter
+    def screen_off(self, enabled: bool) -> None:
+        self.flg2 = (self.flg2 | 0x80) if enabled else (self.flg2 & ~0x80)
+
+    @property
+    def adv_interval_ms(self) -> float:
+        return self.advertising_interval * 62.5
+
+    def set_adv_interval_ms(self, ms: float) -> None:
+        steps = int(round(ms / 62.5))
+        self.advertising_interval = max(1, min(255, steps))
+
+    @property
+    def measure_interval_s(self) -> float:
+        return (self.adv_interval_ms * self.measure_interval) / 1000.0
+
+    def set_measure_interval(self, mult: int) -> None:
+        self.measure_interval = max(1, min(255, int(mult)))
+
+    @property
+    def connect_latency_ms(self) -> int:
+        return (self.connect_latency + 1) * 20
+
+    def set_connect_latency_ms(self, ms: float) -> None:
+        lat = int(round((ms / 20.0) - 1.0))
+        max_lat = 49 if self.ver > 0x40 else 200
+        self.connect_latency = max(0, min(max_lat, lat))
+
+    @property
+    def lcd_refresh_s(self) -> float:
+        return round(self.lcd_tint * 0.05, 2)
+
+    def set_lcd_refresh_s(self, sec: float) -> None:
+        val = int(round(sec / 0.05))
+        self.lcd_tint = max(10, min(255, val))
+
+    def set_rf_tx_power(self, val: int) -> None:
+        v = int(val)
+        if v & 0x80:
+            v = max(130, min(191, v))
+        else:
+            v = max(23, min(63, v))
+        self.rf_tx_power = v
+
+    @property
+    def temp_offset_c(self) -> float:
+        return self.temp_offset / 10.0
+
+    def set_temp_offset_c(self, offset_c: float) -> None:
+        if self.ver >= 0x47:
+            raise ValueError(
+                f"Simple temperature offset in 0x55 is only used on firmware < 4.7 "
+                f"(current v{self.ver_str}); use --sensor-cal on >= 4.7."
+            )
+        self.temp_offset = max(-127, min(127, int(round(offset_c * 10.0))))
+
+    @property
+    def humi_offset_pct(self) -> float:
+        return self.humi_offset / 10.0
+
+    def set_humi_offset_pct(self, offset_pct: float) -> None:
+        if self.ver >= 0x47:
+            raise ValueError(
+                f"Simple humidity offset in 0x55 is only used on firmware < 4.7 "
+                f"(current v{self.ver_str}); use --sensor-cal on >= 4.7."
+            )
+        self.humi_offset = max(-127, min(127, int(round(offset_pct * 10.0))))
+
+    @property
+    def adv_delay_steps(self) -> int:
+        return self.temp_offset & 0x0F
+
+    def set_adv_delay_steps(self, steps: int) -> None:
+        s = max(0, min(15, int(steps)))
+        self.temp_offset = (self.temp_offset & 0xF0) | s
+
+    @property
+    def event_adv_cnt(self) -> int:
+        return self.humi_offset & 0xFF
+
+    def set_event_adv_cnt(self, count: int) -> None:
+        c = max(5, min(255, int(count)))
+        if c >= 128:
+            c -= 256
+        self.humi_offset = c
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "version": self.ver_str,
+            "hwver_id": self.hwver_id,
+            "adv_type": self.adv_type,
+            "adv_flags": self.adv_flags,
+            "encrypted": self.encrypted,
+            "bt5_phy": self.bt5_phy,
+            "long_range": self.long_range,
+            "screen_off": self.screen_off,
+            "temp_unit": self.temp_unit,
+            "comfort": self.comfort,
+            "blinking": self.blinking,
+            "show_batt": self.show_batt,
+            "smiley": self.smiley,
+            "tx_measures": self.tx_measures,
+            "lp_measures": self.lp_measures,
+            "adv_interval_ms": self.adv_interval_ms,
+            "measure_interval": self.measure_interval,
+            "measure_interval_s": round(self.measure_interval_s, 2),
+            "rf_tx_power": self.rf_tx_power,
+            "connect_latency_ms": self.connect_latency_ms,
+            "lcd_refresh_s": self.lcd_refresh_s,
+            "av_meas_mem": self.av_meas_mem,
+            "raw_hex": self.to_set_packet().hex(),
+        }
+        if self.ver < 0x47:
+            d["temp_offset_c"] = self.temp_offset_c
+            d["humi_offset_pct"] = self.humi_offset_pct
+        elif self.ver > 0x50 and not self.is_clock_only_hw:
+            d["adv_delay_ms"] = round(self.adv_delay_steps * 0.625, 3)
+            d["event_adv_cnt"] = self.event_adv_cnt
+        return d
+
+    def format_summary(self) -> str:
+        lines = [
+            f"  Adv Type:        {self.adv_type} (encrypted={'yes' if self.encrypted else 'no'}, "
+            f"ad_flags={'on' if self.adv_flags else 'off'})",
+            f"  BLE PHY:         BT5+={'on' if self.bt5_phy else 'off'}, "
+            f"LongRange={'on' if self.long_range else 'off'}, RF_TX={self.rf_tx_power}",
+            f"  Intervals:       adv={self.adv_interval_ms:.1f} ms, "
+            f"measure={self.measure_interval}x ({self.measure_interval_s:.1f} s), "
+            f"conn_latency={self.connect_latency_ms} ms",
+            f"  Display:         unit={self.temp_unit}, screen_off={'yes' if self.screen_off else 'no'}, "
+            f"comfort={'on' if self.comfort else 'off'}, batt={'on' if self.show_batt else 'off'}, "
+            f"smiley={self.smiley}, lcd_tint={self.lcd_refresh_s:.2f} s",
+            f"  Measurements:    tx_measures={'on' if self.tx_measures else 'off'}, "
+            f"lp_measures={'on' if self.lp_measures else 'off'}, mem_avg={self.av_meas_mem}",
+        ]
+        if self.ver < 0x47:
+            lines.append(
+                f"  Offsets:         temp={self.temp_offset_c:+.1f} °C, humi={self.humi_offset_pct:+.1f} %"
+            )
+        elif self.ver > 0x50 and not self.is_clock_only_hw:
+            lines.append(
+                f"  Adv Extra:       adv_delay={self.adv_delay_steps} ({self.adv_delay_steps * 0.625:.3f} ms), "
+                f"event_adv_cnt={self.event_adv_cnt}"
+            )
+        return "\n".join(lines)
+
+
+@dataclasses.dataclass
 class DeviceProfile:
     address: str
     name: str
@@ -182,6 +573,7 @@ class DeviceProfile:
     temperature_c: Optional[float] = None
     humidity_pct: Optional[int] = None
     battery_mv: Optional[int] = None
+    pvvx_config: Optional[PvvxConfig] = None
 
     @property
     def is_lywsd03mmc(self) -> bool:
@@ -988,6 +1380,7 @@ async def probe_device_profile(
         _, hwver_id = map_lywsd03mmc_hw(hw_rev)
 
     # If running custom pvvx firmware (0x1f10), query 0x55 config block for exact hwver_id & bigOta
+    pvvx_config: Optional[PvvxConfig] = None
     if custom_enabled:
         cfg_char = _get_service_char(client, UUID_SVC_CUSTOM, UUID_CHR_CUSTOM_CFG)
         if cfg_char is not None and "notify" in (cfg_char.properties or []):
@@ -1001,14 +1394,9 @@ async def probe_device_profile(
                 await write_gatt_auto(client, cfg_char, b"\x55")
                 pkt = await asyncio.wait_for(cfg_evt.get(), timeout=2.5)
                 if len(pkt) >= 10 and pkt[0] == 0x55:
-                    custom_ver = pkt[1]
-                    hver_byte = pkt[11] if len(pkt) >= 12 else 0x80
-                    if custom_ver < 0x36:
-                        hver_byte &= 0x87
-                    if custom_ver < 0x48:
-                        hwver_id = hver_byte & 0x0F
-                    else:
-                        hwver_id = hver_byte
+                    pvvx_config = PvvxConfig.from_bytes(pkt)
+                    custom_ver = pvvx_config.ver
+                    hwver_id = pvvx_config.hwver_id
                     if custom_ver > 0x45:
                         big_ota_enabled = True
             except Exception:
@@ -1064,6 +1452,7 @@ async def probe_device_profile(
         temperature_c=temp_c,
         humidity_pct=humi_pct,
         battery_mv=bat_mv,
+        pvvx_config=pvvx_config,
     )
 
 
@@ -1347,6 +1736,9 @@ def format_device_profile(profile: DeviceProfile) -> str:
             f"Live Telemetry:    {profile.temperature_c:.2f} °C, "
             f"{profile.humidity_pct}% rH, {profile.battery_mv} mV"
         )
+    if profile.pvvx_config is not None:
+        lines.append("Custom Config (0x55):")
+        lines.append(profile.pvvx_config.format_summary())
     if profile.is_fw_211_0159:
         lines.append(
             f"2.1.1_0159 Notes:  Requires Mi Home registration + 24-hex Mi Token login + "
@@ -1574,6 +1966,426 @@ async def run_flash_workflow(
 
 
 # ---------------------------------------------------------------------------
+# Custom Firmware Configuration Helpers & GATT Operations (0x1f10 / 0x1f1f)
+# ---------------------------------------------------------------------------
+
+def _parse_on_off(value: str) -> bool:
+    v = value.strip().lower()
+    if v in ("1", "true", "on", "yes", "enable", "enabled"):
+        return True
+    if v in ("0", "false", "off", "no", "disable", "disabled"):
+        return False
+    raise ValueError(f"Invalid boolean '{value}' (expected on/off, true/false, or 1/0).")
+
+
+def build_dev_name_packet(name: Optional[str]) -> bytes:
+    """Build command `0x01` to set custom device name (1..18 UTF-8 bytes) or reset (`None`/`''`)."""
+    if not name:
+        return b"\x01\x00"
+    raw = name.encode("utf-8")
+    if not 1 <= len(raw) <= 18:
+        raise ValueError("Device name must be 1..18 UTF-8 bytes.")
+    return b"\x01" + raw
+
+
+def build_bindkey_packet(bindkey_hex: str) -> bytes:
+    """Build command `0x18` to write a 16-byte (32 hex) beacon bindkey into EEP."""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", bindkey_hex or "")
+    if len(cleaned) != 32:
+        raise ValueError("BindKey must be exactly 32 hex characters (16 bytes).")
+    return b"\x18" + bytes.fromhex(cleaned)
+
+
+def build_pincode_packet(pin: str) -> bytes:
+    """Build command `0x70` to set/disable BLE pincode (`000000` disables)."""
+    s = (pin or "").strip()
+    if len(s) != 6 or not s.isdigit():
+        raise ValueError("PinCode must be 6 decimal digits (000000..999999; 000000 disables).")
+    return struct.pack("<BI", 0x70, int(s, 10))
+
+
+def build_sync_time_packet(local_epoch_s: Optional[int] = None) -> bytes:
+    """
+    Build command `0x23` matching TelinkMiFlasher.html (`Date.now()/1000 - getTimezoneOffset()*60`),
+    sending local wall-clock epoch seconds so the LCD displays local time.
+    """
+    if local_epoch_s is None:
+        now_local = datetime.now().astimezone()
+        utc_offset_s = int((now_local.utcoffset().total_seconds()) if now_local.utcoffset() else 0)
+        local_epoch_s = int(time.time()) + utc_offset_s
+    return struct.pack("<BI", 0x23, int(local_epoch_s) & 0xFFFFFFFF)
+
+
+def build_comfort_packet(temp_lo: float, temp_hi: float, humi_lo: float, humi_hi: float) -> bytes:
+    """Build command `0x20` for comfort temperature/humidity thresholds."""
+    return struct.pack(
+        "<Bhhhh",
+        0x20,
+        int(round(temp_lo * 100.0)),
+        int(round(temp_hi * 100.0)),
+        int(round(humi_lo * 100.0)),
+        int(round(humi_hi * 100.0)),
+    )
+
+
+def build_sensor_cal_packet(
+    temp_k: float,
+    temp_z: float,
+    humi_k: float,
+    humi_z: float,
+) -> bytes:
+    """Build command `0x25` for sensor linear calibration (`T = RegT*Tk/65536 + Tz`, firmware >= 4.7)."""
+    return struct.pack(
+        "<BIIhh",
+        0x25,
+        int(round(temp_k * 100.0)) & 0xFFFFFFFF,
+        int(round(humi_k * 100.0)) & 0xFFFFFFFF,
+        int(round(temp_z * 100.0)),
+        int(round(humi_z * 100.0)),
+    )
+
+
+def parse_custom_notification(pkt: bytes) -> Dict[str, Any]:
+    """Decode common response packets from custom firmware characteristic `0x1f1f`."""
+    if not pkt:
+        return {"raw": ""}
+    blkid = pkt[0]
+    payload = pkt[1:]
+    if blkid == 0x55 and len(pkt) >= 10:
+        return {"id": 0x55, "type": "config", "config": PvvxConfig.from_bytes(pkt)}
+    if blkid == 0x01:
+        name = bytes(payload).split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return {"id": 0x01, "type": "name", "name": name}
+    if blkid == 0x18:
+        if len(payload) >= 16:
+            return {"id": 0x18, "type": "bindkey", "bindkey": bytes(payload[:16]).hex()}
+        return {"id": 0x18, "type": "bindkey", "bindkey": None}
+    if blkid == 0x20 and len(payload) >= 8:
+        t_lo, t_hi, h_lo, h_hi = struct.unpack_from("<hhHH", payload, 0)
+        return {
+            "id": 0x20,
+            "type": "comfort",
+            "temp_lo": t_lo / 100.0,
+            "temp_hi": t_hi / 100.0,
+            "humi_lo": h_lo / 100.0,
+            "humi_hi": h_hi / 100.0,
+        }
+    if blkid == 0x23 and len(payload) >= 4:
+        cur_t = struct.unpack_from("<I", payload, 0)[0]
+        return {"id": 0x23, "type": "time", "dev_time": cur_t}
+    if blkid in (0x25, 0x26) and len(payload) >= 12:
+        tk, hk, tz, hz = struct.unpack_from("<IIhh", payload, 0)
+        return {
+            "id": blkid,
+            "type": "sensor_cal",
+            "temp_k": tk / 100.0,
+            "humi_k": hk / 100.0,
+            "temp_z": tz / 100.0,
+            "humi_z": hz / 100.0,
+        }
+    return {"id": blkid, "type": "raw", "raw": pkt.hex()}
+
+
+def apply_pvvx_config_updates(cfg: PvvxConfig, updates: Dict[str, Any]) -> bool:
+    """
+    Apply high-level configuration fields onto a `PvvxConfig` instance.
+    Returns `True` if any `0x55` field was specified.
+    """
+    changed = False
+
+    preset = updates.get("preset")
+    if preset:
+        p = str(preset).strip().lower()
+        if p == "atb-flow":
+            # Optimized for ATB-Flow / Tasmota 16.0 BLE bridge:
+            # BTHome v2 unencrypted + AdFlags + 2500 ms adv + 10 s measure interval
+            cfg.set_adv_type("bthome2")
+            cfg.encrypted = False
+            cfg.adv_flags = True
+            cfg.set_adv_interval_ms(2500.0)
+            cfg.set_measure_interval(4)
+            changed = True
+        else:
+            raise ValueError(f"Unknown config preset '{preset}' (supported: atb-flow).")
+
+    if updates.get("adv_type") is not None:
+        cfg.set_adv_type(str(updates["adv_type"]))
+        changed = True
+    if updates.get("adv_flags") is not None:
+        cfg.adv_flags = bool(updates["adv_flags"])
+        changed = True
+    if updates.get("encrypted") is not None:
+        cfg.encrypted = bool(updates["encrypted"])
+        changed = True
+    if updates.get("bt5_phy") is not None:
+        cfg.bt5_phy = bool(updates["bt5_phy"])
+        changed = True
+    if updates.get("long_range") is not None:
+        cfg.long_range = bool(updates["long_range"])
+        changed = True
+    if updates.get("screen_off") is not None:
+        cfg.screen_off = bool(updates["screen_off"])
+        changed = True
+    if updates.get("temp_unit") is not None:
+        cfg.temp_unit = str(updates["temp_unit"])
+        changed = True
+    if updates.get("comfort") is not None:
+        cfg.comfort = bool(updates["comfort"])
+        changed = True
+    if updates.get("blinking") is not None:
+        cfg.blinking = bool(updates["blinking"])
+        changed = True
+    if updates.get("show_batt") is not None:
+        cfg.show_batt = bool(updates["show_batt"])
+        changed = True
+    if updates.get("smiley") is not None:
+        cfg.smiley = int(updates["smiley"])
+        changed = True
+    if updates.get("tx_measures") is not None:
+        cfg.tx_measures = bool(updates["tx_measures"])
+        changed = True
+    if updates.get("lp_measures") is not None:
+        cfg.lp_measures = bool(updates["lp_measures"])
+        changed = True
+    if updates.get("adv_interval_ms") is not None:
+        cfg.set_adv_interval_ms(float(updates["adv_interval_ms"]))
+        changed = True
+    if updates.get("measure_interval") is not None:
+        cfg.set_measure_interval(int(updates["measure_interval"]))
+        changed = True
+    if updates.get("rf_tx_power") is not None:
+        cfg.set_rf_tx_power(int(updates["rf_tx_power"]))
+        changed = True
+    if updates.get("connect_latency_ms") is not None:
+        cfg.set_connect_latency_ms(float(updates["connect_latency_ms"]))
+        changed = True
+    if updates.get("lcd_refresh_s") is not None:
+        cfg.set_lcd_refresh_s(float(updates["lcd_refresh_s"]))
+        changed = True
+    if updates.get("av_meas_mem") is not None:
+        cfg.av_meas_mem = max(0, min(255, int(updates["av_meas_mem"])))
+        changed = True
+    if updates.get("temp_offset") is not None:
+        cfg.set_temp_offset_c(float(updates["temp_offset"]))
+        changed = True
+    if updates.get("humi_offset") is not None:
+        cfg.set_humi_offset_pct(float(updates["humi_offset"]))
+        changed = True
+    if updates.get("adv_delay_steps") is not None:
+        cfg.set_adv_delay_steps(int(updates["adv_delay_steps"]))
+        changed = True
+    if updates.get("event_adv_cnt") is not None:
+        cfg.set_event_adv_cnt(int(updates["event_adv_cnt"]))
+        changed = True
+
+    return changed
+
+
+async def _send_custom_and_wait(
+    client: Any,
+    cfg_char: Any,
+    cmd: bytes,
+    expect_ids: Optional[Sequence[int]] = None,
+    timeout_s: float = 2.5,
+) -> Optional[bytes]:
+    """Write a command to `0x1f1f` and await a matching notification if requested."""
+    q: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def _on_notify(_sender: Any, data: bytearray) -> None:
+        q.put_nowait(bytes(data))
+
+    has_notify = "notify" in (cfg_char.properties or [])
+    if has_notify:
+        await client.start_notify(cfg_char, _on_notify)
+    try:
+        await write_gatt_auto(client, cfg_char, cmd)
+        if not has_notify:
+            return None
+        deadline = time.monotonic() + timeout_s
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return None
+            try:
+                pkt = await asyncio.wait_for(q.get(), timeout=rem)
+            except asyncio.TimeoutError:
+                return None
+            if expect_ids is None or (pkt and pkt[0] in expect_ids):
+                return pkt
+    finally:
+        if has_notify:
+            try:
+                await client.stop_notify(cfg_char)
+            except Exception:
+                pass
+
+
+async def configure_connected_device(
+    client: Any,
+    profile: DeviceProfile,
+    updates: Dict[str, Any],
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Read and/or apply pvvx custom firmware configuration on an already-connected client."""
+    if not profile.custom_enabled:
+        raise FlasherError(
+            f"Device {profile.address} ({profile.name}) does not expose custom service 0x1f10 "
+            "(flash custom pvvx/ATC firmware first)."
+        )
+    cfg_char = _get_service_char(client, UUID_SVC_CUSTOM, UUID_CHR_CUSTOM_CFG)
+    if cfg_char is None:
+        raise FlasherError(f"Custom config characteristic {UUID_CHR_CUSTOM_CFG} not found on {profile.address}.")
+
+    result: Dict[str, Any] = {"address": profile.address, "name": profile.name}
+
+    # Optional factory default reset (0x56)
+    if updates.get("reset_default"):
+        log("Restoring pvvx default configuration (0x56)...")
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x56", expect_ids=(0x55,), timeout_s=2.5)
+        if pkt is None:
+            pkt = await _send_custom_and_wait(client, cfg_char, b"\x55", expect_ids=(0x55,), timeout_s=2.5)
+        if pkt is not None:
+            profile.pvvx_config = PvvxConfig.from_bytes(pkt)
+
+    # Ensure we have the latest 0x55 config block
+    if profile.pvvx_config is None:
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x55", expect_ids=(0x55,), timeout_s=2.5)
+        if pkt is None:
+            raise FlasherError(f"Failed to read 0x55 config from {profile.address}.")
+        profile.pvvx_config = PvvxConfig.from_bytes(pkt)
+
+    cfg = profile.pvvx_config
+    if apply_pvvx_config_updates(cfg, updates):
+        set_pkt = cfg.to_set_packet()
+        log(f"Writing custom config (0x55): {set_pkt.hex()}")
+        resp = await _send_custom_and_wait(client, cfg_char, set_pkt, expect_ids=(0x55,), timeout_s=2.5)
+        if resp is None:
+            resp = await _send_custom_and_wait(client, cfg_char, b"\x55", expect_ids=(0x55,), timeout_s=2.5)
+        if resp is not None:
+            cfg = PvvxConfig.from_bytes(resp)
+            profile.pvvx_config = cfg
+
+    result["config"] = cfg.to_dict()
+
+    # Optional secondary commands
+    if updates.get("reset_name"):
+        pkt = await _send_custom_and_wait(client, cfg_char, build_dev_name_packet(None), expect_ids=(0x01,))
+        if pkt is not None:
+            result["dev_name"] = parse_custom_notification(pkt).get("name")
+    elif updates.get("set_name") is not None:
+        pkt = await _send_custom_and_wait(
+            client, cfg_char, build_dev_name_packet(str(updates["set_name"])), expect_ids=(0x01,)
+        )
+        if pkt is not None:
+            result["dev_name"] = parse_custom_notification(pkt).get("name")
+    elif updates.get("get_name"):
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x01", expect_ids=(0x01,))
+        if pkt is not None:
+            result["dev_name"] = parse_custom_notification(pkt).get("name")
+
+    if updates.get("bindkey") is not None:
+        pkt = await _send_custom_and_wait(
+            client, cfg_char, build_bindkey_packet(str(updates["bindkey"])), expect_ids=(0x18,)
+        )
+        if pkt is not None:
+            result["bindkey"] = parse_custom_notification(pkt).get("bindkey")
+    elif updates.get("get_bindkey"):
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x18", expect_ids=(0x18,))
+        if pkt is not None:
+            result["bindkey"] = parse_custom_notification(pkt).get("bindkey")
+
+    if updates.get("pincode") is not None:
+        await _send_custom_and_wait(
+            client, cfg_char, build_pincode_packet(str(updates["pincode"])), expect_ids=None, timeout_s=0.6
+        )
+        result["pincode_set"] = True
+
+    if updates.get("sync_time"):
+        pkt = await _send_custom_and_wait(client, cfg_char, build_sync_time_packet(), expect_ids=(0x23,))
+        result["time_synced"] = True
+        if pkt is not None:
+            result["dev_time"] = parse_custom_notification(pkt).get("dev_time")
+
+    if updates.get("comfort_range") is not None:
+        t_lo, t_hi, h_lo, h_hi = updates["comfort_range"]
+        pkt = await _send_custom_and_wait(
+            client, cfg_char, build_comfort_packet(t_lo, t_hi, h_lo, h_hi), expect_ids=(0x20,)
+        )
+        if pkt is not None:
+            result["comfort_range"] = parse_custom_notification(pkt)
+
+    if updates.get("reset_sensor_cal"):
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x26", expect_ids=(0x25, 0x26))
+        if pkt is not None:
+            result["sensor_cal"] = parse_custom_notification(pkt)
+    elif updates.get("sensor_cal") is not None:
+        tk, tz, hk, hz = updates["sensor_cal"]
+        pkt = await _send_custom_and_wait(
+            client, cfg_char, build_sensor_cal_packet(tk, tz, hk, hz), expect_ids=(0x25,)
+        )
+        if pkt is not None:
+            result["sensor_cal"] = parse_custom_notification(pkt)
+    elif updates.get("get_sensor_cal"):
+        pkt = await _send_custom_and_wait(client, cfg_char, b"\x25", expect_ids=(0x25,))
+        if pkt is not None:
+            result["sensor_cal"] = parse_custom_notification(pkt)
+
+    if updates.get("raw_cmd"):
+        raw_hex = re.sub(r"[^0-9a-fA-F]", "", str(updates["raw_cmd"]))
+        if not raw_hex or len(raw_hex) % 2 != 0:
+            raise ValueError("--raw-cmd must be an even-length hex string (e.g. '55' or '33ff').")
+        raw_bytes = bytes.fromhex(raw_hex)
+        pkt = await _send_custom_and_wait(client, cfg_char, raw_bytes, expect_ids=None, timeout_s=2.0)
+        result["raw_cmd_tx"] = raw_hex
+        result["raw_cmd_rx"] = pkt.hex() if pkt is not None else None
+
+    return result
+
+
+async def run_config(
+    mac: str,
+    updates: Dict[str, Any],
+    json_output: bool = False,
+    adapter: Optional[str] = None,
+    retries: int = 5,
+    scan_timeout_s: float = 12.0,
+) -> Dict[str, Any]:
+    client, adv_name = await connect_with_retries(
+        mac=mac, adapter=adapter, scan_timeout_s=scan_timeout_s, retries=retries
+    )
+    try:
+        profile = await probe_device_profile(client, normalize_mac(mac), adv_name)
+        res = await configure_connected_device(
+            client=client,
+            profile=profile,
+            updates=updates,
+            log=(lambda _s: None) if json_output else print,
+        )
+        if not json_output:
+            print(f"Device:            {profile.address} ({profile.name}, custom v{profile.pvvx_config.ver_str})")
+            print(profile.pvvx_config.format_summary())
+            if "dev_name" in res:
+                print(f"  Device Name:     {res['dev_name']}")
+            if "bindkey" in res:
+                print(f"  EEP BindKey:     {res['bindkey'] or '<none>'}")
+            if "sensor_cal" in res:
+                sc = res["sensor_cal"]
+                print(
+                    f"  Sensor Cal:      Tk={sc.get('temp_k')}, Tz={sc.get('temp_z')}, "
+                    f"Hk={sc.get('humi_k')}, Hz={sc.get('humi_z')}"
+                )
+            if "raw_cmd_rx" in res:
+                print(f"  Raw Cmd RX:      {res['raw_cmd_rx'] or '<none>'}")
+        return res
+    finally:
+        if getattr(client, "is_connected", False):
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # CLI Argument Parsing & Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -1690,6 +2502,92 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_flash.add_argument("--adapter", help="Linux BlueZ adapter name, e.g. hci0")
     p_flash.add_argument("--retries", type=int, default=5, help="Connection retries (default: 5)")
     p_flash.add_argument("--scan-timeout", type=float, default=12.0, help="Per-attempt scan timeout in seconds")
+    p_flash.add_argument(
+        "--config-preset",
+        choices=["atb-flow"],
+        help="Optional pvvx config preset to apply after flashing custom firmware (reconnects after reboot)",
+    )
+
+    # --- config ---
+    p_cfg = sub.add_parser(
+        "config",
+        help="Read and/or update custom pvvx/ATC firmware configuration (service 0x1f10 / 0x1f1f)",
+    )
+    cfg_target = p_cfg.add_mutually_exclusive_group(required=True)
+    cfg_target.add_argument("--mac", help="Target BLE MAC address (AA:BB:CC:DD:EE:FF)")
+    cfg_target.add_argument(
+        "--macs",
+        help="Comma-separated list of BLE MAC addresses to configure sequentially",
+    )
+    cfg_target.add_argument(
+        "--all-lywsd03mmc",
+        action="store_true",
+        help="Sequentially configure all LYWSD03MMC sensors listed in --tokens-file",
+    )
+    p_cfg.add_argument(
+        "--tokens-file",
+        type=Path,
+        help="Xiaomi-cloud-tokens-extractor file (required with --all-lywsd03mmc)",
+    )
+    p_cfg.add_argument("--json", action="store_true", help="Output configuration as JSON")
+    p_cfg.add_argument(
+        "--preset",
+        choices=["atb-flow"],
+        help="Apply a predefined config preset ('atb-flow' = BTHome v2, unencrypted, AdFlags on, 2500ms/10s)",
+    )
+    p_cfg.add_argument(
+        "--reset-default",
+        action="store_true",
+        help="Send command 0x56 to restore firmware default configuration before applying other flags",
+    )
+    p_cfg.add_argument(
+        "--adv-type",
+        choices=["atc1441", "pvvx", "mijia", "bthome2", "bthome1", "all"],
+        help="Advertising packet format (recommended for Tasmota 16.0+: bthome2)",
+    )
+    p_cfg.add_argument("--adv-flags", type=_parse_on_off, metavar="{on,off}", help="Enable/disable AdFlags (flg2 bit 4)")
+    p_cfg.add_argument("--encrypted", type=_parse_on_off, metavar="{on,off}", help="Enable/disable encrypted beacons")
+    p_cfg.add_argument("--bt5-phy", type=_parse_on_off, metavar="{on,off}", help="Enable/disable BT5+ PHY / CSA2")
+    p_cfg.add_argument("--long-range", type=_parse_on_off, metavar="{on,off}", help="Enable/disable Coded PHY S8 long range")
+    p_cfg.add_argument("--screen-off", type=_parse_on_off, metavar="{on,off}", help="Turn LCD off (on/off)")
+    p_cfg.add_argument("--temp-unit", choices=["C", "F", "c", "f"], help="Display temperature unit (C or F)")
+    p_cfg.add_argument("--comfort", type=_parse_on_off, metavar="{on,off}", help="Show comfort smiley indicator (on/off)")
+    p_cfg.add_argument("--blinking", type=_parse_on_off, metavar="{on,off}", help="Show blinking/clock mode on LCD (on/off)")
+    p_cfg.add_argument("--show-batt", type=_parse_on_off, metavar="{on,off}", help="Show battery indicator on LCD (on/off)")
+    p_cfg.add_argument("--smiley", type=int, choices=range(0, 8), help="Fixed smiley / screen mode (0..7)")
+    p_cfg.add_argument("--tx-measures", type=_parse_on_off, metavar="{on,off}", help="Transmit measurements when connected")
+    p_cfg.add_argument("--lp-measures", type=_parse_on_off, metavar="{on,off}", help="Low-power measurement mode (v4.8+)")
+    p_cfg.add_argument("--adv-interval-ms", type=float, help="Advertising interval in ms (62.5..15937.5, step 62.5)")
+    p_cfg.add_argument("--measure-interval", type=int, help="Measure interval multiplier (1..255 x adv-interval)")
+    p_cfg.add_argument("--rf-tx-power", type=int, help="RF TX power register (VBAT: 23..63, VANT: 130..191)")
+    p_cfg.add_argument("--connect-latency-ms", type=float, help="BLE connection latency in ms (20..1000, step 20)")
+    p_cfg.add_argument("--lcd-refresh-s", type=float, help="Minimum LCD refresh interval in s (0.5..12.75, step 0.05)")
+    p_cfg.add_argument("--av-meas-mem", type=int, help="Flash averaging memory count (0=off..255)")
+    p_cfg.add_argument("--temp-offset", type=float, help="Temperature offset in °C (-12.7..12.7, firmware < 4.7)")
+    p_cfg.add_argument("--humi-offset", type=float, help="Humidity offset in %% (-12.7..12.7, firmware < 4.7)")
+    p_cfg.add_argument("--adv-delay-steps", type=int, help="Pseudo-random adv delay in 0.625 ms steps (0..15, fw > 5.0)")
+    p_cfg.add_argument("--event-adv-cnt", type=int, help="Event beacon duplicate count (5..255, fw > 5.0)")
+    p_cfg.add_argument("--name", dest="set_name", help="Set custom BLE device name (1..18 chars)")
+    p_cfg.add_argument("--reset-name", action="store_true", help="Reset BLE device name to default (ATC_xxxx)")
+    p_cfg.add_argument("--get-name", action="store_true", help="Query current BLE device name (0x01)")
+    p_cfg.add_argument("--bindkey", help="Set 32-hex EEP beacon bindkey (0x18)")
+    p_cfg.add_argument("--get-bindkey", action="store_true", help="Read current EEP beacon bindkey (0x18)")
+    p_cfg.add_argument("--pincode", help="Set 6-digit BLE pincode (000000 disables)")
+    p_cfg.add_argument("--sync-time", action="store_true", help="Sync device clock to host local time (0x23)")
+    p_cfg.add_argument(
+        "--comfort-range",
+        help="Set comfort thresholds as t_lo,t_hi,h_lo,h_hi (e.g. 20.0,25.0,35.0,60.0)",
+    )
+    p_cfg.add_argument(
+        "--sensor-cal",
+        help="Set linear sensor calibration Tk,Tz,Hk,Hz (e.g. 100.0,0.0,100.0,0.0 for fw >= 4.7)",
+    )
+    p_cfg.add_argument("--get-sensor-cal", action="store_true", help="Query linear sensor calibration (0x25)")
+    p_cfg.add_argument("--reset-sensor-cal", action="store_true", help="Reset linear sensor calibration (0x26)")
+    p_cfg.add_argument("--raw-cmd", help="Send raw hex command to custom config characteristic 0x1f1f")
+    p_cfg.add_argument("--adapter", help="Linux BlueZ adapter name, e.g. hci0")
+    p_cfg.add_argument("--retries", type=int, default=5, help="Connection retries (default: 5)")
+    p_cfg.add_argument("--scan-timeout", type=float, default=12.0, help="Per-attempt scan timeout in seconds")
 
     # --- build-image ---
     p_build = sub.add_parser(
@@ -1707,6 +2605,105 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--cache-dir", type=Path, default=default_cache_dir(), help="Cache folder for upstream files")
 
     return parser
+
+
+def _parse_float_quad(spec: str, flag_name: str) -> Tuple[float, float, float, float]:
+    parts = [p.strip() for p in (spec or "").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"{flag_name} expects 4 comma-separated numbers, got '{spec}'.")
+    return float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+
+
+def _extract_config_updates(args: argparse.Namespace) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {
+        "preset": args.preset,
+        "reset_default": args.reset_default,
+        "adv_type": args.adv_type,
+        "adv_flags": args.adv_flags,
+        "encrypted": args.encrypted,
+        "bt5_phy": args.bt5_phy,
+        "long_range": args.long_range,
+        "screen_off": args.screen_off,
+        "temp_unit": args.temp_unit,
+        "comfort": args.comfort,
+        "blinking": args.blinking,
+        "show_batt": args.show_batt,
+        "smiley": args.smiley,
+        "tx_measures": args.tx_measures,
+        "lp_measures": args.lp_measures,
+        "adv_interval_ms": args.adv_interval_ms,
+        "measure_interval": args.measure_interval,
+        "rf_tx_power": args.rf_tx_power,
+        "connect_latency_ms": args.connect_latency_ms,
+        "lcd_refresh_s": args.lcd_refresh_s,
+        "av_meas_mem": args.av_meas_mem,
+        "temp_offset": args.temp_offset,
+        "humi_offset": args.humi_offset,
+        "adv_delay_steps": args.adv_delay_steps,
+        "event_adv_cnt": args.event_adv_cnt,
+        "set_name": args.set_name,
+        "reset_name": args.reset_name,
+        "get_name": args.get_name,
+        "bindkey": args.bindkey,
+        "get_bindkey": args.get_bindkey,
+        "pincode": args.pincode,
+        "sync_time": args.sync_time,
+        "get_sensor_cal": args.get_sensor_cal,
+        "reset_sensor_cal": args.reset_sensor_cal,
+        "raw_cmd": args.raw_cmd,
+    }
+    if args.comfort_range is not None:
+        updates["comfort_range"] = _parse_float_quad(args.comfort_range, "--comfort-range")
+    if args.sensor_cal is not None:
+        updates["sensor_cal"] = _parse_float_quad(args.sensor_cal, "--sensor-cal")
+    return updates
+
+
+async def _run_flash_and_optional_config(
+    *,
+    mac: str,
+    mi_token: Optional[str],
+    firmware_path: Optional[Path],
+    sign_file_path: Optional[Path],
+    signed_original: bool,
+    two_stage: bool,
+    force_no_sign: bool,
+    reboot_wait_s: float,
+    cache_dir: Path,
+    refresh_cache: bool,
+    adapter: Optional[str],
+    retries: int,
+    scan_timeout_s: float,
+    block_delay_s: float,
+    config_preset: Optional[str],
+) -> None:
+    await run_flash_workflow(
+        mac=mac,
+        mi_token=mi_token,
+        firmware_path=firmware_path,
+        sign_file_path=sign_file_path,
+        signed_original=signed_original,
+        two_stage=two_stage,
+        force_no_sign=force_no_sign,
+        reboot_wait_s=reboot_wait_s,
+        cache_dir=cache_dir,
+        refresh_cache=refresh_cache,
+        adapter=adapter,
+        retries=retries,
+        scan_timeout_s=scan_timeout_s,
+        block_delay_s=block_delay_s,
+    )
+    if config_preset and not signed_original:
+        print(f"Waiting {reboot_wait_s:.0f}s for {mac} to reboot before applying preset '{config_preset}'...")
+        await asyncio.sleep(reboot_wait_s)
+        await run_config(
+            mac=mac,
+            updates={"preset": config_preset},
+            json_output=False,
+            adapter=adapter,
+            retries=max(retries, 6),
+            scan_timeout_s=scan_timeout_s,
+        )
 
 
 def _cmd_list_tokens(args: argparse.Namespace) -> int:
@@ -1793,6 +2790,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             )
 
+        if args.command == "config":
+            updates = _extract_config_updates(args)
+            if args.mac:
+                targets = [normalize_mac(args.mac)]
+            elif args.macs:
+                targets = [normalize_mac(m.strip()) for m in args.macs.split(",") if m.strip()]
+                if not targets:
+                    raise FlasherError("No valid MAC addresses provided to --macs.")
+            else:
+                if not args.tokens_file:
+                    raise FlasherError("--all-lywsd03mmc requires --tokens-file <path>.")
+                creds_list = parse_tokens_file(args.tokens_file)
+                targets = [
+                    normalize_mac(c.mac)
+                    for c in creds_list
+                    if c.mac
+                    and (
+                        (c.model or "") == "miaomiaoce.sensor_ht.t2"
+                        or "LYWSD03MMC" in (c.name or "").upper()
+                    )
+                ]
+                if not targets:
+                    raise FlasherError(f"No LYWSD03MMC MAC addresses found in '{args.tokens_file}'.")
+
+            results: List[Dict[str, Any]] = []
+            failures: List[Tuple[str, str]] = []
+            for idx, target_mac in enumerate(targets, 1):
+                if len(targets) > 1 and not args.json:
+                    print(f"\n[{idx}/{len(targets)}] Configuring {target_mac}...")
+                try:
+                    res = asyncio.run(
+                        run_config(
+                            mac=target_mac,
+                            updates=updates,
+                            json_output=args.json,
+                            adapter=args.adapter,
+                            retries=args.retries,
+                            scan_timeout_s=args.scan_timeout,
+                        )
+                    )
+                    results.append(res)
+                except Exception as exc:
+                    if len(targets) == 1:
+                        raise
+                    print(f"ERROR configuring {target_mac}: {exc}", file=sys.stderr)
+                    failures.append((target_mac, str(exc)))
+
+            if args.json:
+                print(json.dumps(results[0] if len(targets) == 1 and results else results, indent=2))
+            if failures:
+                print(f"\nCompleted with {len(failures)}/{len(targets)} failure(s):", file=sys.stderr)
+                for fmac, ferr in failures:
+                    print(f"  - {fmac}: {ferr}", file=sys.stderr)
+                return 1
+            return 0
+
         if args.command == "flash":
             creds_list = parse_tokens_file(args.tokens_file) if args.tokens_file else []
 
@@ -1819,7 +2872,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(f"\n[{idx}/{len(targets)}] Flashing {item.mac} ({item.name or item.model or ''})...")
                     try:
                         asyncio.run(
-                            run_flash_workflow(
+                            _run_flash_and_optional_config(
                                 mac=item.mac,
                                 mi_token=tk,
                                 firmware_path=args.firmware,
@@ -1834,6 +2887,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 retries=args.retries,
                                 scan_timeout_s=args.scan_timeout,
                                 block_delay_s=max(args.block_delay_ms, 0.0) / 1000.0,
+                                config_preset=args.config_preset,
                             )
                         )
                     except Exception as exc:
@@ -1873,7 +2927,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 token, _ = validate_mi_credentials(token, bind_key)
 
             asyncio.run(
-                run_flash_workflow(
+                _run_flash_and_optional_config(
                     mac=target_mac,
                     mi_token=token,
                     firmware_path=args.firmware,
@@ -1888,6 +2942,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     retries=args.retries,
                     scan_timeout_s=args.scan_timeout,
                     block_delay_s=max(args.block_delay_ms, 0.0) / 1000.0,
+                    config_preset=args.config_preset,
                 )
             )
             return 0
